@@ -1374,6 +1374,10 @@ pub(crate) struct HostList {
     /// Upload memory for data the list's draws make (expanded vertices),
     /// reused after a reset.
     scratch: Mutex<Scratch>,
+    /// Upload memory a copy into a texture is staged in, reused after a
+    /// reset: its own pool, as with [`card_steps`] above 1 it is memory the
+    /// card may fill too ([`Chunk::shared`]).
+    staged: Mutex<Scratch>,
     /// Host texture states the list assumes, by host copy: at its start and
     /// at its end. Lists are recorded on many threads and run in submission
     /// order, so the transitions from a texture's real state are made at
@@ -2047,10 +2051,12 @@ impl Drop for Counted {
 }
 
 /// A chunk of upload memory for lists' scratch data: the buffer, its
-/// mapping.
+/// mapping, and whether the card may fill it too (a copy's staging memory
+/// with `VICTORY_CARD_STEPS` above 1).
 struct Chunk {
     buffer: ID3D12Resource,
     data: usize,
+    shared: bool,
 }
 
 // SAFETY: a D3D12 resource (free-threaded) and its persistent mapping,
@@ -2111,8 +2117,14 @@ impl<T> Spare<T> {
     }
 
     /// A kept thing of `size` bytes, the one given last.
+    #[cfg(test)]
     fn take(&mut self, size: u64) -> Option<T> {
-        let at = self.kept.iter().rposition(|(_, s)| *s == size)?;
+        self.take_matching(size, |_| true)
+    }
+
+    /// A kept thing of `size` bytes that `f` takes, the one given last.
+    fn take_matching(&mut self, size: u64, f: impl Fn(&T) -> bool) -> Option<T> {
+        let at = self.kept.iter().rposition(|(thing, s)| *s == size && f(thing))?;
         self.bytes -= size;
         Some(self.kept.remove(at).0)
     }
@@ -2132,23 +2144,28 @@ impl<T> Spare<T> {
 /// Scratch chunks no list holds.
 static SPARE: Mutex<Spare<Chunk>> = Mutex::new(Spare::new());
 
-/// A scratch chunk of `size` bytes: one kept ([`SPARE`]) or a new one.
-fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
+/// A scratch chunk of `size` bytes: one kept ([`SPARE`]) of the same kind,
+/// or a new one.
+fn take_chunk(host: &Host, size: u64, shared: bool) -> Option<Chunk> {
     if scratch_pool()
-        && let Some(chunk) = SPARE.lock().unwrap_or_else(|e| e.into_inner()).take(size)
+        && let Some(chunk) = SPARE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take_matching(size, |c| c.shared == shared)
     {
         ALIVE[3].fetch_sub(1, Ordering::Relaxed);
         ALIVE[4].fetch_sub(size, Ordering::Relaxed);
         ALIVE[5].fetch_add(1, Ordering::Relaxed);
         return Some(chunk);
     }
-    let (buffer, data) = host.upload_buffer(size)?;
-    name(&buffer, || "list scratch".into());
+    let (buffer, data) = if shared { host.shared_buffer(size)? } else { host.upload_buffer(size)? };
+    name(&buffer, || if shared { "list staging".into() } else { "list scratch".into() });
     ALIVE[1].fetch_add(1, Ordering::Relaxed);
     ALIVE[2].fetch_add(size, Ordering::Relaxed);
     Some(Chunk {
         buffer,
         data: data as usize,
+        shared,
     })
 }
 
@@ -4328,6 +4345,7 @@ impl Host {
                 list,
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
+                staged: Mutex::default(),
                 states: Mutex::default(),
                 twins: Mutex::default(),
                 prelude,
@@ -6601,6 +6619,13 @@ impl HostList {
                 give_chunks(std::mem::take(&mut scratch.chunks));
             }
         }
+        {
+            let mut staged = self.staged.lock().unwrap_or_else(|e| e.into_inner());
+            (staged.current, staged.used) = (0, 0);
+            if scratch_pool() {
+                give_chunks(std::mem::take(&mut staged.chunks));
+            }
+        }
         // SAFETY: the list is not executing.
         let reset = unsafe {
             self.allocator
@@ -7317,22 +7342,21 @@ impl HostList {
         self.deferred().writes.push((dst as usize, what, bytes));
     }
 
-    /// A mapped upload buffer of `size` bytes, alive until the list is
-    /// reset.
-    ///
-    /// shortcut: one buffer per copy; pool them once uploads are frequent.
-    pub(crate) fn upload(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
-        // With [`card_steps`] the card may be the one that fills it.
-        let (buffer, data) = if card_steps::stage() > 1 { host.shared_buffer(size)? } else { host.upload_buffer(size)? };
-        name(&buffer, || format!("list upload {size:#x}"));
-        self.deferred().hold_upload(buffer.clone(), size);
-        Some((buffer, data))
+    /// `size` bytes of mapped upload memory a copy into a texture is staged
+    /// in, the offset a multiple of a placed footprint's (512 bytes), alive
+    /// until the list is reset: the buffer, the offset in it and the CPU
+    /// pointer. Taken from the list's staging chunks, shared with the card
+    /// where the card fills copies ([`card_steps`]), so a copy makes no
+    /// buffer of its own (from Belobug 5e08eee).
+    pub(crate) fn upload(&self, size: u64) -> Option<(ID3D12Resource, u64, *mut u8)> {
+        const PLACED: u64 = 512;
+        self.stage_at(size, PLACED, card_steps::stage() > 1)
     }
 
     /// `len` bytes of upload memory (256-byte aligned) until the list is
     /// reset: the host GPU address and the CPU pointer.
     pub(crate) fn scratch(&self, len: u64) -> Option<(u64, *mut u8)> {
-        let (buffer, at, data) = self.scratch_at(len)?;
+        let (buffer, at, data) = self.stage_at(len, 256, false)?;
         // SAFETY: a live buffer.
         Some((unsafe { buffer.GetGPUVirtualAddress() } + at, data))
     }
@@ -7340,42 +7364,50 @@ impl HostList {
     /// [`HostList::scratch`] and the buffer it lies in, for a descriptor
     /// slot to hold: the slot outlives the list's use of it.
     pub(crate) fn scratch_held(&self, len: u64) -> Option<(ID3D12Resource, u64, *mut u8)> {
-        let (buffer, at, data) = self.scratch_at(len)?;
+        let (buffer, at, data) = self.stage_at(len, 256, false)?;
         // SAFETY: a live buffer.
         let gpu = unsafe { buffer.GetGPUVirtualAddress() } + at;
         Some((buffer, gpu, data))
     }
 
-    /// [`HostList::scratch`]: the buffer, the offset in it and the CPU
-    /// pointer.
-    fn scratch_at(&self, len: u64) -> Option<(ID3D12Resource, u64, *mut u8)> {
+    /// [`HostList::scratch`] with `align` and a chosen kind of memory: the
+    /// buffer, the offset in it and the CPU pointer.
+    fn stage_at(&self, len: u64, align: u64, shared: bool) -> Option<(ID3D12Resource, u64, *mut u8)> {
         let host = host()?;
-        let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
+        let pool = if shared { &self.staged } else { &self.scratch };
+        let mut s = pool.lock().unwrap_or_else(|e| e.into_inner());
         let len = len.max(1).next_multiple_of(256);
         if len > SCRATCH_CHUNK {
-            let (buffer, data) = host.upload_buffer(len)?;
+            let (buffer, data) = if shared { host.shared_buffer(len)? } else { host.upload_buffer(len)? };
             name(&buffer, || format!("list scratch {len:#x}"));
             self.deferred().hold_upload(buffer.clone(), len);
             return Some((buffer, 0, data));
         }
-        // The chunk in use while `len` fits in what is left of it, else the
-        // next one (a list's first chunk may be a small one).
-        while s.current < s.chunks.len() && s.used + len > s.chunks[s.current].1 {
+        // The chunk in use while `len` fits in what is left of it at the
+        // alignment, else the next one (a list's first chunk may be a small
+        // one).
+        let mut at;
+        loop {
+            if s.current == s.chunks.len() {
+                let size = if scratch_pool() && s.chunks.is_empty() && len <= SCRATCH_FIRST {
+                    SCRATCH_FIRST
+                } else {
+                    SCRATCH_CHUNK
+                };
+                let chunk = take_chunk(host, size, shared)?;
+                s.chunks.push((chunk, size));
+                (s.current, s.used) = (s.chunks.len() - 1, 0);
+                at = 0;
+                break;
+            }
+            at = s.used.next_multiple_of(align);
+            if at + len <= s.chunks[s.current].1 {
+                break;
+            }
             (s.current, s.used) = (s.current + 1, 0);
         }
-        if s.current == s.chunks.len() {
-            let size = if scratch_pool() && s.chunks.is_empty() && len <= SCRATCH_FIRST {
-                SCRATCH_FIRST
-            } else {
-                SCRATCH_CHUNK
-            };
-            let chunk = take_chunk(host, size)?;
-            s.chunks.push((chunk, size));
-            s.used = 0;
-        }
         let (data, buffer) = (s.chunks[s.current].0.data, s.chunks[s.current].0.buffer.clone());
-        let at = s.used;
-        s.used += len;
+        s.used = at + len;
         Some((buffer, at, (data + at as usize) as *mut u8))
     }
 
@@ -7664,7 +7696,7 @@ impl HostList {
         read: (usize, usize),
         fill: impl Fn(usize) + Send + 'static,
     ) -> Option<ID3D12Resource> {
-        let chunk = take_chunk(host()?, size)?;
+        let chunk = take_chunk(host()?, size, false)?;
         let source = chunk.buffer.clone();
         let destination = chunk.data;
         let mut deferred = self.deferred();
@@ -10742,6 +10774,57 @@ mod spare {
         assert_eq!(spare.take(1), Some(2));
         assert_eq!(spare.bytes, 0);
         assert!(spare.kept.is_empty());
+    }
+
+    /// Of one size, only a thing the predicate takes comes back: chunks of
+    /// the card's memory and of the PC's are kept apart.
+    #[test]
+    fn matching_things_come_back_by_size_and_kind() {
+        let mut spare: Spare<u32> = Spare::new();
+        assert_eq!(spare.give(2, 8, 100), None);
+        assert_eq!(spare.give(4, 8, 100), None);
+        assert_eq!(spare.give(6, 8, 100), None);
+        assert_eq!(spare.take_matching(8, |_| true), Some(6), "the last given");
+        assert_eq!(spare.take_matching(8, |thing| *thing == 2), Some(2), "the one the kind takes");
+        assert_eq!(spare.take_matching(8, |thing| *thing == 2), None);
+        assert_eq!(spare.take_matching(8, |_| true), Some(4));
+        assert_eq!(spare.bytes, 0);
+    }
+}
+
+#[cfg(test)]
+mod staging {
+    use super::*;
+
+    /// A copy's staging is placed in a chunk: pieces a placed footprint's
+    /// alignment apart, sharing their buffer, that do not overlap.
+    #[test]
+    fn staging_pieces_are_placed_apart_in_one_chunk() {
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        let list = host.new_list().expect("a host list");
+        let (first, at1, data1) = list.upload(1000).expect("staging");
+        let (second, at2, data2) = list.upload(1000).expect("staging");
+        assert_eq!(at1 % 512, 0, "a placed footprint's offset");
+        assert_eq!(at2 % 512, 0, "a placed footprint's offset");
+        assert_eq!(first.as_raw(), second.as_raw(), "the pieces share their chunk");
+        // Each piece has room for what was asked (rounded to the chunk's
+        // step) before the next one begins.
+        const PIECE: usize = 1024;
+        // SAFETY: both are mapped, and `PIECE` bytes lie in each piece.
+        unsafe {
+            std::ptr::write_bytes(data1, 0xAA, PIECE);
+            std::ptr::write_bytes(data2, 0x55, PIECE);
+            for i in 0..PIECE {
+                assert_eq!(*data1.add(i), 0xAA, "the first piece, byte {i}");
+                assert_eq!(*data2.add(i), 0x55, "the second piece, byte {i}");
+            }
+        }
+        // The list's scratch memory is placed one after another too, and
+        // nothing of it overlaps the staging.
+        let (gpu, _) = list.scratch(300).expect("scratch");
+        assert_eq!(gpu % 256, 0, "scratch is 256-byte aligned");
     }
 }
 

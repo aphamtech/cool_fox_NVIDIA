@@ -107,5 +107,10 @@ each commit naming its source. In short:
   over a buffer's own bytes.
 - DexNom: thread counts of ray dispatches, cube gradients, joined sparse ranges.
 - Belobug: pipeline workers for screen passes, the ambient stand-in's idea, pipeline and
-  constant buffer bookkeeping (romainhedouin).
+  constant buffer bookkeeping (romainhedouin), copies' staging from the lists' pooled
+  chunks, one codegen unit in the release profile. Read to Belobug c816767 (2026-11-26);
+  the rest of that merge is here another way (the clean-up passes, the quick table hash,
+  the stack root constants, the read-write views table), or is the AMD fork's own (its
+  pipeline library's compile watchdog, sparse copies of title memory, ambient following
+  the sky).
 - ZJOU: render targets not set again; some shader corrections are being looked at.

@@ -83,7 +83,11 @@ opt-level = 2
 [profile.release]
 debug = "line-tables-only"
 lto = "thin"
-codegen-units = 16
+# One codegen unit with thin LTO: the layer spends its time hashing, copying
+# and translating, and the recording path calls across small modules (draw,
+# host, shadow, resource), so cross-unit inlining pays for the slower build
+# (from Belobug a23d1b4, PR #96).
+codegen-units = 1
 
 # The development build: release code generation plus the `diagnostics`
 # feature (`cargo build --profile diag -p victory --features diagnostics`),

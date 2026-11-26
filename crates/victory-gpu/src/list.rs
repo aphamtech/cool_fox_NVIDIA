@@ -1102,7 +1102,7 @@ extern "system" fn copy_texture_region(
         #[cfg(feature = "diagnostics")]
         let mut read = None;
         if src.kind == FOOTPRINT {
-            let (Some(host), Some(bytes)) = (crate::host::host(), src.footprint.bytes()) else {
+            let Some(bytes) = src.footprint.bytes() else {
                 return;
             };
             let Some(data) = buffer_range(src.resource, src.footprint.offset, bytes) else {
@@ -1112,23 +1112,24 @@ extern "system" fn copy_texture_region(
                 // What shaders wrote to it, at this place of the list.
                 Some(buffer) => buffer,
                 None => {
-                    let Some((buffer, staging)) = list.upload(host, bytes) else {
+                    let Some((buffer, at, staging)) = list.upload(bytes) else {
                         return;
                     };
-                    // The list owns this mapped D3D12 upload buffer. Wine can
+                    // The list owns this mapped D3D12 upload memory. Wine can
                     // report its address as MEM_FREE, so use the host-upload
-                    // path.
+                    // path. Its staging is a piece of a chunk: the footprint
+                    // starts where the piece does.
                     list.defer_fill_buffer(&buffer, staging, data, bytes as usize);
+                    from.footprint.offset = at;
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        // SAFETY: a live buffer.
+                        read = Some((unsafe { buffer.GetGPUVirtualAddress() } + at, bytes));
+                    }
                     buffer
                 }
             };
             from.resource = buffer.as_raw().cast_const().cast();
-            from.footprint.offset = 0;
-            #[cfg(feature = "diagnostics")]
-            {
-                // SAFETY: a live buffer.
-                read = Some((unsafe { buffer.GetGPUVirtualAddress() }, bytes));
-            }
             _upload = buffer;
         } else {
             let Some(texture) = crate::resource::host_resource(src.resource) else {

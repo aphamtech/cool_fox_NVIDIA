@@ -1287,8 +1287,9 @@ mod tests {
             // What depends on them: a copy of the first copy, upload memory
             // filled from that, and the first one's bytes copied over.
             b.defer_copy((start + 1_500_000) as *mut u8, (start + HALF + 600) as *const u8, 700);
-            let (staging, staged) = b.upload(host, 4096).unwrap();
+            let (staging, at, staged) = b.upload(4096).unwrap();
             b.defer_fill_buffer(&staging, staged, (start + 1_500_100) as *const u8, 500);
+            assert_eq!(at % 512, 0, "a placed footprint's staging is 512-byte aligned");
             b.defer_copy((start + HALF + 300) as *mut u8, (start + 8000) as *const u8, 64);
             b.close();
             host.execute_own(&b);

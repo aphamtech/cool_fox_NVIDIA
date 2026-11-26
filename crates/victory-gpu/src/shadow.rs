@@ -5043,13 +5043,19 @@ fn buffers_read() -> std::sync::RwLockReadGuard<'static, BTreeMap<(u64, usize), 
 
 /// A title buffer exists at `start` (`len` bytes).
 pub(crate) fn register(resource: usize, start: u64, len: u64) {
-    buffers().insert(
+    let before = buffers().insert(
         (start, resource),
         Entry {
             end: start + len,
             shadow: None,
         },
     );
+    // A buffer made again at the same place and address: its old copy may
+    // still be named by lists and descriptors, as one the title released is
+    // (from Belobug 40b8b9b).
+    if let Some(shadow) = before.and_then(|e| e.shadow) {
+        crate::host::retire(shadow);
+    }
 }
 
 /// The title released it; lists that still hold its copy keep it alive.
