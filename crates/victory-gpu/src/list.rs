@@ -786,6 +786,49 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
         }
         // SAFETY: the title passes `count` barriers.
         let barriers = unsafe { std::slice::from_raw_parts(barriers, count as usize) };
+        if crate::graphics::uma_bridge_enabled() {
+            const BEGIN_ONLY: u32 = 1;
+            for b in barriers {
+                match b.kind {
+                    0 => {
+                        if b.flags & BEGIN_ONLY != 0 {
+                            continue;
+                        }
+                        list.record_placed_aliasing(b.first);
+                        let wanted = crate::host::texture_state(b.last as u32);
+                        if let Some((texture, before)) = list.transition(b.first, wanted) {
+                            let legal = crate::host::legal_state(texture, wanted);
+                            list.push_transition_barrier(texture, u32::MAX, before, legal);
+                        }
+                    }
+                    1 => {
+                        // Host textures are committed resources (distinct host heaps);
+                        // D3D12 rejects non-null committed resources in aliasing barriers
+                        // with E_INVALIDARG on Close(). Preserve ordering via a global
+                        // UAV barrier when an explicit Xbox aliasing barrier is seen.
+                        list.push_uav_barrier(None);
+                    }
+                    2 => {
+                        if b.first.is_null() {
+                            list.push_uav_barrier(None);
+                        } else if let Some(twin) = crate::resource::twin_resource(b.first) {
+                            list.push_uav_barrier(Some(twin));
+                        } else if let Some(tex) = crate::resource::host_resource(b.first) {
+                            list.push_uav_barrier(Some(tex));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if barriers.iter().any(|b| {
+                b.kind != 1 && !b.first.is_null() && crate::resource::buffer_bytes(b.first).is_some()
+            }) {
+                list.push_uav_barrier(None);
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::WaitsForBuffers, 1);
+            }
+            return 0;
+        }
         let mut host: Vec<Barrier> = barriers
             .iter()
             .filter_map(|b| host_barrier(list, b))
@@ -820,6 +863,14 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
 /// Moves a title texture's host copy to `state` in the list, if needed.
 #[cfg(windows)]
 pub(crate) fn ensure_state(list: &crate::host::HostList, resource: This, state: u32) {
+    if crate::graphics::uma_bridge_enabled() {
+        list.record_placed_aliasing(resource);
+        if let Some((texture, before)) = list.transition(resource, state) {
+            let legal = crate::host::legal_state(texture, state);
+            list.push_transition_barrier(texture, u32::MAX, before, legal);
+        }
+        return;
+    }
     use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES as State;
     if let Some((texture, before)) = list.transition(resource, state) {
         let state = crate::host::legal_state(texture, state);
@@ -951,6 +1002,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             }
             ensure_state(list, dst, COPY_DEST);
             ensure_state(list, src, COPY_SOURCE);
+            list.flush_barriers();
             #[cfg(feature = "diagnostics")]
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
             // SAFETY: an open list and live textures.
@@ -1172,6 +1224,7 @@ extern "system" fn copy_texture_region(
         }
         const _: () =
             assert!(size_of::<CopyLocation>() == size_of::<D3D12_TEXTURE_COPY_LOCATION>());
+        list.flush_barriers();
         // SAFETY: an open list; both locations in the host's layout, naming
         // live resources; the box is the title's (same layout).
         unsafe {
@@ -1242,6 +1295,7 @@ fn read_back(
             src.resource, src.footprint.offset as u32, dst.resource, dst.footprint.offset
         )
     });
+    list.flush_barriers();
     // SAFETY: an open list; both locations in the host's layout (asserted
     // in `copy_texture_region`), naming a live texture and our buffer, which
     // the list keeps until it is reset; the box is the title's.
@@ -1300,6 +1354,7 @@ extern "system" fn resolve(
         crate::texture::card_writes(list, dst, to, Some(dst_sub));
         ensure_state(list, dst, RESOLVE_DEST);
         ensure_state(list, src, RESOLVE_SOURCE);
+        list.flush_barriers();
         crate::texture::host_written(dst);
         #[cfg(feature = "diagnostics")]
         list.note_op(|| format!("resolve {src:?} to {dst:?} format {format}"));
@@ -1373,17 +1428,24 @@ extern "system" fn clear_rtv(
         });
         const RENDER_TARGET: u32 = 0x4;
         let rtv = host.rtv(Some(texture), record.desc().as_ref());
-        // SAFETY: an open list, a fresh view of a live texture.
-        unsafe {
-            if let Some((_, before)) = list.transition(record.resource, RENDER_TARGET) {
-                use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES as State;
-                list.list.ResourceBarrier(&[crate::host::transition(
-                    texture,
-                    State(before as i32),
-                    State(RENDER_TARGET as i32),
-                )]);
+        if crate::graphics::uma_bridge_enabled() {
+            ensure_state(list, record.resource, RENDER_TARGET);
+            list.flush_barriers();
+            // SAFETY: an open list, a fresh view of a live texture.
+            unsafe { list.list.ClearRenderTargetView(rtv, color, rects) };
+        } else {
+            // SAFETY: an open list, a fresh view of a live texture.
+            unsafe {
+                if let Some((_, before)) = list.transition(record.resource, RENDER_TARGET) {
+                    use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES as State;
+                    list.list.ResourceBarrier(&[crate::host::transition(
+                        texture,
+                        State(before as i32),
+                        State(RENDER_TARGET as i32),
+                    )]);
+                }
+                list.list.ClearRenderTargetView(rtv, color, rects);
             }
-            list.list.ClearRenderTargetView(rtv, color, rects);
         }
     }
     #[cfg(not(windows))]
@@ -1427,6 +1489,7 @@ extern "system" fn clear_dsv(
             crate::resource::DEPTH_UNORDERED[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         let dsv = host.dsv(texture, record.depth_desc().as_ref());
+        list.flush_barriers();
         // SAFETY: an open list, a fresh view of a live texture.
         unsafe {
             list.list
@@ -1580,10 +1643,15 @@ extern "system" fn sync(this: This, flags: u32, control: u32, address: u64, size
                 }
                 crate::copystat::add(crate::copystat::C::WaitsForGroups, 1);
             }
-            // SAFETY: the same layout; no resource named.
-            let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
-            // SAFETY: an open list.
-            unsafe { list.list.ResourceBarrier(&[barrier]) };
+            if crate::graphics::uma_bridge_enabled() {
+                list.push_uav_barrier(None);
+            } else {
+                // SAFETY: the same layout; no resource named.
+                let barrier =
+                    unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
+                // SAFETY: an open list.
+                unsafe { list.list.ResourceBarrier(&[barrier]) };
+            }
         }
     }
     let _ = (this, flags, control, address, size);
@@ -2151,8 +2219,12 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
     if count > 0
         && let Some(list) = host_list(this)
     {
-        use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
         with_state(this, |_, state| state.synced());
+        if crate::graphics::uma_bridge_enabled() {
+            list.push_uav_barrier(None);
+            return;
+        }
+        use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
         // SAFETY: the same layout; no resource named.
         let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
         // SAFETY: an open list.

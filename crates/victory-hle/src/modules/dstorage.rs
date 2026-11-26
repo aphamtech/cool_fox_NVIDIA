@@ -23,13 +23,26 @@
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
-use std::ffi::{CStr, c_char, c_void};
+use std::ffi::{CStr, OsString, c_char, c_void};
+use std::os::windows::ffi::OsStringExt;
 use std::os::windows::fs::FileExt;
 use std::os::windows::io::FromRawHandle;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 
 use victory_formats::bcpack::{self, Tables};
+use victory_gpu::graphics::contracts::{
+    AsyncIoBackend, BcPackFormat, ComputeQueueBackend, DStoragePlatformHooks, DecompressionBackend,
+    DecompressionCodec, DecompressionExecutionMode, DecompressionJob, DecompressionOutput,
+    VelocityIoError,
+};
+use victory_gpu::graphics::velocity_io::dstorage_thunk::velocity_error_to_hresult;
+use victory_gpu::graphics::velocity_io::{
+    DStorageQueueDescX, DStorageRequestX, DecompressionRegistry, GpuDecompressQueue,
+    MockComputeQueueBackend, VelocityFactory, VelocityFile, VelocityQueue, VelocityStatusArray,
+    Win32OverlappedIo,
+};
 
 use super::xasync::{E_INVALIDARG, E_NOTIMPL, E_PENDING};
 use super::xgameruntime::{Guid, HRESULT, Methods, Object, S_OK, add_ref, missing, put};
@@ -113,6 +126,212 @@ fn from_win32(error: &std::io::Error) -> HRESULT {
         .map_or(E_INVALIDARG, |e| (0x8007_0000 | (e as u32 & 0xffff)) as i32)
 }
 
+// ---------------------------------------------------------------------------
+// Subsystem B (`velocity_io`) HLE bridge (`VICTORY_VELOCITY_IO=1`)
+// ---------------------------------------------------------------------------
+
+/// `victory-hle` implementation of [`DStoragePlatformHooks`] connecting
+/// `victory_gpu::graphics::velocity_io` to virtual drive rewriting (`files.rs`),
+/// 64 KiB physical page writes (`xmem.rs`), and GPU memory write notifications.
+struct HleDStoragePlatformHooks;
+
+impl DStoragePlatformHooks for HleDStoragePlatformHooks {
+    fn rewrite_virtual_path(&self, raw_utf16_path: &[u16]) -> PathBuf {
+        let end = raw_utf16_path
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(raw_utf16_path.len());
+        let trimmed = &raw_utf16_path[..end];
+        if let Some(mut translated) = super::files::translate(trimmed) {
+            if translated.last() == Some(&0) {
+                translated.pop();
+            }
+            PathBuf::from(OsString::from_wide(&translated))
+        } else {
+            PathBuf::from(OsString::from_wide(trimmed))
+        }
+    }
+
+    fn write_physical_pages(
+        &self,
+        page_list_addr: usize,
+        page_offset: u16,
+        data: &[u8],
+    ) -> Result<(), VelocityIoError> {
+        if page_list_addr == 0 {
+            return Err(VelocityIoError::InvalidRequest(
+                "physical page list address is null",
+            ));
+        }
+        if data.is_empty() {
+            return Ok(());
+        }
+        let offset = usize::from(page_offset);
+        let len = data.len();
+        let list = page_list_addr as *const usize;
+        let mut pages = page_list(list, offset, len);
+        for _ in 0..3 {
+            write_bytes_to_pages(&pages, offset, data)?;
+            let now = read_list(list, offset, len);
+            if now == pages || !super::xmem::pages_known(&now, offset, len) {
+                break;
+            }
+            tracing::warn!(
+                list = format_args!("{list:p}"),
+                offset,
+                len,
+                first = pages.first(),
+                first_now = now.first(),
+                "dstorage(velocity_io): destination page list changed during write; rewriting new pages"
+            );
+            pages = now;
+        }
+        Ok(())
+    }
+
+    fn notify_memory_written(&self, address: usize, len: usize) {
+        if super::xmem::stream_notice() {
+            victory_gpu::kernel_will_write(address, len);
+        } else {
+            victory_gpu::title_memory_written(address, len, false);
+        }
+    }
+}
+
+/// Writes `data` into Xbox 64 KiB physical `pages` starting at `offset` in the first page.
+fn write_bytes_to_pages(pages: &[usize], offset: usize, data: &[u8]) -> Result<(), VelocityIoError> {
+    if let Some(mut window) = super::xmem::page_window(pages, offset, data.len()) {
+        window.bytes().copy_from_slice(data);
+        super::xmem::pages_written(pages, offset, data.len());
+        return Ok(());
+    }
+    static RETRIES: OnceLock<u32> = OnceLock::new();
+    let retries = *RETRIES.get_or_init(|| {
+        std::env::var("VICTORY_DSTORAGE_RETRIES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(12)
+    });
+    let mut written = super::xmem::write_physical(pages, offset, data);
+    let mut tries = 0;
+    while !written && tries < retries {
+        std::thread::sleep(std::time::Duration::from_millis(
+            (2u64 << tries.min(6)).min(128),
+        ));
+        tries += 1;
+        written = super::xmem::write_physical(pages, offset, data);
+    }
+    if written {
+        super::xmem::pages_written(pages, offset, data.len());
+        Ok(())
+    } else {
+        Err(VelocityIoError::InvalidRequest(
+            "destination physical pages could not be written",
+        ))
+    }
+}
+
+/// Optional HLE-only [`DecompressionBackend`] delegating to `victory_formats::bcpack::decode`.
+///
+/// Registered ONLY in the HLE [`DecompressionRegistry`] when
+/// `VICTORY_VELOCITY_IO_LEGACY_BCPACK=1`. `victory_gpu::graphics::velocity_io::BcPackStubBackend`
+/// remains completely untouched as a pure documented stub (Rule 1).
+struct HleLegacyBcPackAdapter;
+
+const HLE_BCPACK_CODECS: [DecompressionCodec; 6] = [
+    DecompressionCodec::BcPack(BcPackFormat::Bc1),
+    DecompressionCodec::BcPack(BcPackFormat::Bc3),
+    DecompressionCodec::BcPack(BcPackFormat::Bc4),
+    DecompressionCodec::BcPack(BcPackFormat::Bc5),
+    DecompressionCodec::BcPack(BcPackFormat::Bc6h),
+    DecompressionCodec::BcPack(BcPackFormat::Bc7),
+];
+
+impl DecompressionBackend for HleLegacyBcPackAdapter {
+    fn name(&self) -> &'static str {
+        "hle-legacy-bcpack"
+    }
+
+    fn supported_codecs(&self) -> &'static [DecompressionCodec] {
+        &HLE_BCPACK_CODECS
+    }
+
+    fn execution_mode(&self) -> DecompressionExecutionMode {
+        DecompressionExecutionMode::CpuWorkerFallback
+    }
+
+    fn decompress(
+        &self,
+        job: &DecompressionJob<'_>,
+        _compute: &dyn ComputeQueueBackend,
+    ) -> Result<DecompressionOutput, VelocityIoError> {
+        let DecompressionCodec::BcPack(fmt) = job.codec else {
+            return Err(VelocityIoError::InvalidRequest(
+                "HleLegacyBcPackAdapter invoked for non-BCPack codec",
+            ));
+        };
+        let tables = bcpack_tables().map_err(|_| VelocityIoError::ProprietaryCodecStub {
+            codec: job.codec,
+            hint: "legacy BCPack tables unavailable",
+        })?;
+        let mut out = vec![0u8; job.expected_output_len];
+        bcpack::decode(fmt as u8, job.src_bytes, &mut out, tables).map_err(|e| {
+            VelocityIoError::DecompressionFailed {
+                codec: job.codec,
+                reason: e.to_string(),
+            }
+        })?;
+        let bytes_written = out.len();
+        Ok(DecompressionOutput {
+            bytes_written,
+            completion_fence: None,
+            cpu_bytes: Some(out),
+        })
+    }
+}
+
+fn build_velocity_factory(enable_legacy_bcpack: bool) -> Result<VelocityFactory, VelocityIoError> {
+    let io: Arc<dyn AsyncIoBackend> = Arc::new(Win32OverlappedIo::new()?);
+    let registry = Arc::new(DecompressionRegistry::with_defaults());
+    if enable_legacy_bcpack {
+        registry.register(Arc::new(HleLegacyBcPackAdapter));
+    }
+    let compute: Arc<dyn ComputeQueueBackend> = victory_gpu::shared_compute_queue()
+        .unwrap_or_else(|| Arc::new(MockComputeQueueBackend::new(2)));
+    let gpu_decompress = Arc::new(GpuDecompressQueue::with_registry(compute, registry));
+    // Keep HLE DirectStorage staging in cached host RAM (the factory's shared
+    // 4 KiB-aligned `PinnedUploadRing`) rather than a Write-Combine ReBAR VRAM
+    // heap, because HLE destinations target CPU/physical pages and decompress
+    // on CPU workers (`zlib-rs` / `bcpack`), where reading back from WC VRAM
+    // stalls PCIe read bandwidth.
+    let factory = VelocityFactory::new(io, gpu_decompress)
+        .with_platform_hooks(Arc::new(HleDStoragePlatformHooks));
+    Ok(factory)
+}
+
+fn velocity_factory() -> Option<&'static VelocityFactory> {
+    static FACTORY: OnceLock<Option<VelocityFactory>> = OnceLock::new();
+    FACTORY
+        .get_or_init(|| {
+            let legacy_bcpack = std::env::var_os("VICTORY_VELOCITY_IO_LEGACY_BCPACK")
+                .is_some_and(|v| v == "1");
+            match build_velocity_factory(legacy_bcpack) {
+                Ok(factory) => {
+                    tracing::info!(
+                        legacy_bcpack,
+                        "dstorage: Velocity I/O factory ready (VICTORY_VELOCITY_IO=1)"
+                    );
+                    Some(factory)
+                }
+                Err(err) => {
+                    tracing::warn!(%err, "dstorage: failed to initialize Velocity I/O factory");
+                    None
+                }
+            }
+        })
+        .as_ref()
+}
+
 // The factory.
 
 type Factory = *const Object;
@@ -125,6 +344,46 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
     if path.is_null() {
         return E_INVALIDARG;
     }
+    // SAFETY: the title passes a NUL-terminated path.
+    let raw_wide = unsafe {
+        let len = (0..).take_while(|&i| *path.add(i) != 0).count();
+        std::slice::from_raw_parts(path, len)
+    };
+    let name = String::from_utf16_lossy(raw_wide);
+
+    if victory_gpu::graphics::velocity_io_enabled() {
+        let Some(factory) = velocity_factory() else {
+            return E_OUTOFMEMORY;
+        };
+        let vfile = match factory.open_file_utf16(raw_wide) {
+            Ok(f) => f,
+            Err(err) => {
+                tracing::warn!(path = name, %err, "dstorage(velocity_io): opening a file failed");
+                return velocity_error_to_hresult(&err);
+            }
+        };
+        let kept = name.clone();
+        tracing::info!(
+            path = name,
+            iid = iid_text(iid),
+            "dstorage(velocity_io): file opened"
+        );
+        let file = Instance::create(
+            Object::new("dstorage file", &FILE_VTABLE),
+            File {
+                backend: FileBackend::Velocity(vfile),
+            },
+        );
+        if stream_log::on() {
+            stream_log::line(format_args!("F\t{:x}\t{kept}", file as usize));
+        }
+        WALLS_FILES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((file as usize, kept));
+        return put(out, file);
+    }
+
     // Goes through `files`, so paths on our virtual drives work too.
     let handle = super::files::CreateFileW(
         path,
@@ -135,11 +394,6 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
         0,
         std::ptr::null_mut(),
     );
-    // SAFETY: the title passes a NUL-terminated path.
-    let name = unsafe {
-        let len = (0..).take_while(|&i| *path.add(i) != 0).count();
-        String::from_utf16_lossy(std::slice::from_raw_parts(path, len))
-    };
     if handle as isize == -1 {
         let error = std::io::Error::last_os_error();
         tracing::warn!(path = name, %error, "dstorage: opening a file failed");
@@ -150,7 +404,12 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
     // SAFETY: a handle we just opened and nobody else owns.
     let file = unsafe { std::fs::File::from_raw_handle(handle) };
     let files = Files::new(file, Io::chosen());
-    let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { files });
+    let file = Instance::create(
+        Object::new("dstorage file", &FILE_VTABLE),
+        File {
+            backend: FileBackend::Legacy(files),
+        },
+    );
     if stream_log::on() {
         stream_log::line(format_args!("F\t{:x}\t{kept}", file as usize));
     }
@@ -172,11 +431,26 @@ extern "system" fn create_status_array(
         iid = iid_text(iid),
         "dstorage: status array"
     );
-    let entries = (0..capacity).map(|_| AtomicI32::new(S_OK)).collect();
     let written = (0..capacity).map(|_| AtomicU64::new(0)).collect();
+    let state = if victory_gpu::graphics::velocity_io_enabled() {
+        let Some(factory) = velocity_factory() else {
+            return E_OUTOFMEMORY;
+        };
+        StatusArray {
+            entries: Box::new([]),
+            velocity: Some(factory.create_status_array(capacity)),
+            written,
+        }
+    } else {
+        StatusArray {
+            entries: (0..capacity).map(|_| AtomicI32::new(S_OK)).collect(),
+            velocity: None,
+            written,
+        }
+    };
     let array = Instance::create(
         Object::new("dstorage status array", &STATUS_VTABLE),
-        StatusArray { entries, written },
+        state,
     );
     put(out, array)
 }
@@ -212,6 +486,34 @@ extern "system" fn create_queue(
         iid = iid_text(iid),
         "dstorage: queue"
     );
+    if victory_gpu::graphics::velocity_io_enabled() {
+        let Some(factory) = velocity_factory() else {
+            return E_OUTOFMEMORY;
+        };
+        let abi_desc = DStorageQueueDescX {
+            source_type: desc.source_type,
+            capacity: desc.capacity,
+            priority: desc.priority,
+            name: desc.name,
+            unknown: desc.unknown,
+        };
+        let vq = match factory.create_queue_from_abi(&abi_desc) {
+            Ok(q) => q,
+            Err(err) => {
+                tracing::warn!(%err, "dstorage(velocity_io): create_queue failed");
+                return velocity_error_to_hresult(&err);
+            }
+        };
+        return put(
+            out,
+            Instance::create(
+                Object::new("dstorage queue", &QUEUE_VTABLE),
+                Queue {
+                    backend: QueueBackend::Velocity(vq),
+                },
+            ),
+        );
+    }
     let Some(scheduler) = scheduler() else {
         return E_OUTOFMEMORY;
     };
@@ -223,7 +525,12 @@ extern "system" fn create_queue(
     drop(lanes);
     put(
         out,
-        Instance::create(Object::new("dstorage queue", &QUEUE_VTABLE), Queue { id }),
+        Instance::create(
+            Object::new("dstorage queue", &QUEUE_VTABLE),
+            Queue {
+                backend: QueueBackend::Legacy(id),
+            },
+        ),
     )
 }
 
@@ -239,6 +546,12 @@ extern "system" fn set_staging_buffer_size(_: Factory, size: u32) -> HRESULT {
             .unwrap_or(256)
     }) << 20;
     tracing::info!(size, floor, "dstorage: staging buffer size");
+    if victory_gpu::graphics::velocity_io_enabled() {
+        if let Some(factory) = velocity_factory() {
+            factory.set_staging_buffer_size(size);
+        }
+        return S_OK;
+    }
     if let Some(scheduler) = scheduler() {
         scheduler.lock().staging = u64::from(size).max(floor);
     }
@@ -276,8 +589,13 @@ static FACTORY_VTABLE: Methods<16> = Methods([
 
 // Files.
 
+enum FileBackend {
+    Legacy(Files),
+    Velocity(VelocityFile),
+}
+
 struct File {
-    files: Files,
+    backend: FileBackend,
 }
 
 /// How files are read (`VICTORY_DSTORAGE_IO`).
@@ -472,6 +790,8 @@ static FILE_VTABLE: Methods<8> = Methods([
 
 struct StatusArray {
     entries: Box<[AtomicI32]>,
+    /// Populated when created under `VICTORY_VELOCITY_IO=1`.
+    velocity: Option<Arc<VelocityStatusArray>>,
     /// For the log: when each entry was written ([`stream_log::now`]); 0
     /// once the title has seen it.
     written: Box<[AtomicU64]>,
@@ -483,8 +803,12 @@ type Array = *mut Instance<StatusArray>;
 /// failure, or success.
 extern "system" fn status_result(this: Array, index: u32) -> HRESULT {
     // SAFETY: an array we created and the title still holds.
-    let entries = &unsafe { &*this }.state.entries;
-    entries
+    let state = &unsafe { &*this }.state;
+    if let Some(ref velocity) = state.velocity {
+        return velocity.hresult(index);
+    }
+    state
+        .entries
         .get(index as usize)
         .map_or(E_INVALIDARG, |e| e.load(Ordering::Acquire))
 }
@@ -492,10 +816,15 @@ extern "system" fn status_result(this: Array, index: u32) -> HRESULT {
 /// The title polls this (entry 0, a `Sleep(1)` loop) and never
 /// reads the result itself.
 extern "system" fn is_complete(this: Array, index: u32) -> bool {
-    let done = status_result(this, index) != E_PENDING;
+    // SAFETY: an array we created and the title still holds.
+    let state = &unsafe { &*this }.state;
+    let done = if let Some(ref velocity) = state.velocity {
+        velocity.is_complete(index)
+    } else {
+        status_result(this, index) != E_PENDING
+    };
     if done && stream_log::on() {
-        // SAFETY: as above.
-        let written = &unsafe { &*this }.state.written;
+        let written = &state.written;
         if let Some(at) = written.get(index as usize).map(|w| w.swap(0, Ordering::Relaxed)).filter(|&at| at != 0) {
             stream_log::line(format_args!("P\t{:x}\t{at}\t{}", this as usize, stream_log::now()));
         }
@@ -513,14 +842,23 @@ static STATUS_VTABLE: Methods<5> = Methods([
 
 // Queues.
 
-/// A queue object: its lane in the scheduler.
+enum QueueBackend {
+    Legacy(u64),
+    Velocity(Arc<VelocityQueue>),
+}
+
+/// A queue object: its lane in the scheduler (or a [`VelocityQueue`] when
+/// `VICTORY_VELOCITY_IO=1`).
 struct Queue {
-    id: u64,
+    backend: QueueBackend,
 }
 
 impl Drop for Queue {
     fn drop(&mut self) {
-        close_lane(self.id);
+        match &self.backend {
+            QueueBackend::Legacy(id) => close_lane(*id),
+            QueueBackend::Velocity(queue) => queue.close(),
+        }
     }
 }
 
@@ -1270,11 +1608,57 @@ extern "system" fn enqueue_request(this: QueueRef, request: *const Request) {
     let Some(&request) = (unsafe { request.as_ref() }) else {
         return;
     };
+    // SAFETY: a queue we created and the title still holds.
+    if let QueueBackend::Velocity(ref vq) = unsafe { &*this }.state.backend {
+        let req_x = DStorageRequestX {
+            options: request.options,
+            destination: request.destination,
+            page_offset: request.page_offset,
+            destination_size: request.destination_size,
+            source: request.source,
+            offset: request.offset,
+            source_size: request.source_size,
+            intermediate_size: request.intermediate_size,
+            tag: request.tag,
+            name: request.name,
+        };
+        let desc = match req_x.to_desc(|src_ptr| {
+            // SAFETY: non-null `source` COM pointer created by `open_file`.
+            match unsafe { &*src_ptr.cast::<Instance<File>>() }.state.backend {
+                FileBackend::Velocity(ref vf) => Ok(vf.handle_id()),
+                FileBackend::Legacy(_) => Err(VelocityIoError::InvalidRequest(
+                    "legacy file handle passed to VelocityQueue",
+                )),
+            }
+        }) {
+            Ok(desc) => desc,
+            Err(err) => {
+                tracing::warn!(%err, "dstorage(velocity_io): invalid enqueue_request");
+                return;
+            }
+        };
+        if let Err(err) = vq.enqueue_request(desc) {
+            tracing::warn!(%err, "dstorage(velocity_io): enqueue_request dropped");
+        }
+        return;
+    }
     let note = Note::enqueued(&request);
     queue(this, Command::Read(Read { request, note }));
 }
 
 extern "system" fn enqueue_status(this: QueueRef, array: Array, index: u32) {
+    // SAFETY: a queue we created and the title still holds.
+    if let QueueBackend::Velocity(ref vq) = unsafe { &*this }.state.backend {
+        // SAFETY: the title passes an array we created (null tolerated).
+        let Some(varray) = (unsafe { array.as_ref() }).and_then(|a| a.state.velocity.as_ref())
+        else {
+            return;
+        };
+        if let Err(err) = vq.enqueue_status(Arc::clone(varray), index) {
+            tracing::warn!(index, %err, "dstorage(velocity_io): enqueue_status failed");
+        }
+        return;
+    }
     // SAFETY: the title passes an array we created (null tolerated).
     let Some(entries) = (unsafe { array.as_ref() }).map(|a| &a.state.entries) else {
         return;
@@ -1310,7 +1694,9 @@ fn half_submits() -> bool {
 /// else could make room.
 fn queue(this: QueueRef, command: Command) {
     // SAFETY: a queue we created and the title still holds.
-    let id = unsafe { &*this }.state.id;
+    let QueueBackend::Legacy(id) = unsafe { &*this }.state.backend else {
+        return;
+    };
     let Some(scheduler) = scheduler() else {
         return;
     };
@@ -1354,7 +1740,15 @@ fn queue(this: QueueRef, command: Command) {
 extern "system" fn submit(this: QueueRef) {
     let _called = victory_gpu::timeline::span("the title's DirectStorage Submit");
     // SAFETY: as above.
-    let id = unsafe { &*this }.state.id;
+    let id = match unsafe { &*this }.state.backend {
+        QueueBackend::Velocity(ref vq) => {
+            if let Err(err) = vq.submit() {
+                tracing::warn!(%err, "dstorage(velocity_io): submit failed");
+            }
+            return;
+        }
+        QueueBackend::Legacy(id) => id,
+    };
     let Some(scheduler) = scheduler() else {
         return;
     };
@@ -1370,7 +1764,10 @@ extern "system" fn submit(this: QueueRef) {
 /// finished. The title calls this, not `Release`.
 extern "system" fn close(this: QueueRef) {
     // SAFETY: as above.
-    close_lane(unsafe { &*this }.state.id);
+    match unsafe { &*this }.state.backend {
+        QueueBackend::Legacy(id) => close_lane(id),
+        QueueBackend::Velocity(ref vq) => vq.close(),
+    }
 }
 
 /// Reads, inflates and/or unpacks, and writes one request.
@@ -1547,9 +1944,12 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
         return Ok(());
     }
     // SAFETY: a file object we created; the title keeps it open.
-    let files = &unsafe { &*request.source.cast::<Instance<File>>() }
+    let FileBackend::Legacy(ref files) = unsafe { &*request.source.cast::<Instance<File>>() }
         .state
-        .files;
+        .backend
+    else {
+        return Err(E_INVALIDARG);
+    };
     let started = std::time::Instant::now();
     let (mut done, mut tries) = (0, 0);
     let result = loop {
@@ -2551,5 +2951,158 @@ mod tests {
         assert_eq!(inflate(&bad_body, &mut out), Err(INVALID_DATA));
         assert_eq!(inflate(&packed, &mut out), Ok(plain.len()));
         assert_eq!(out, plain);
+    }
+
+    #[test]
+    fn velocity_io_hle_bridge_end_to_end() {
+        use crate::modules::{files, xmem};
+
+        // 1. Mount a temporary host directory as a virtual Xbox drive and write
+        //    both raw and zlib-compressed payloads to disk.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let raw_plain = pattern(4096);
+        let page_plain = pattern(2 * PAGE + 256);
+        let page_packed = compress_zlib(&page_plain);
+        let mut file_bytes = Vec::with_capacity(raw_plain.len() + page_packed.len());
+        file_bytes.extend_from_slice(&raw_plain);
+        file_bytes.extend_from_slice(&page_packed);
+        std::fs::write(dir.path().join("stream.pkg"), &file_bytes).expect("write stream.pkg");
+
+        let drive = files::mount(dir.path()).expect("mount virtual drive");
+        let virtual_path = format!("{drive}:\\stream.pkg");
+        let wide_virtual: Vec<u16> = virtual_path.encode_utf16().chain([0]).collect();
+
+        // 2. Build the Velocity I/O factory with real Win32OverlappedIo,
+        //    default DecompressionRegistry (Zlib + pure BcPackStubBackend),
+        //    and HleDStoragePlatformHooks.
+        let factory = build_velocity_factory(false).expect("build VelocityFactory");
+        factory.set_staging_buffer_size(4 * 1024 * 1024);
+
+        // Open via virtual path rewrite hook and wrap in the HLE COM objects to
+        // exercise the actual COM vtable thunks end-to-end.
+        let vfile = factory
+            .open_file_utf16(&wide_virtual)
+            .expect("open virtual path via HleDStoragePlatformHooks");
+        let file_obj = Instance::create(
+            Object::new("dstorage file", &FILE_VTABLE),
+            File {
+                backend: FileBackend::Velocity(vfile),
+            },
+        );
+
+        let desc = DStorageQueueDescX {
+            source_type: 0,
+            capacity: 64,
+            priority: 0,
+            name: c"velocity-hle-e2e".as_ptr(),
+            unknown: 1,
+        };
+        let vqueue = factory
+            .create_queue_from_abi(&desc)
+            .expect("create VelocityQueue");
+        let queue_obj = Instance::create(
+            Object::new("dstorage queue", &QUEUE_VTABLE),
+            Queue {
+                backend: QueueBackend::Velocity(vqueue),
+            },
+        );
+
+        let vstatus = factory.create_status_array(2);
+        let status_obj = Instance::create(
+            Object::new("dstorage status array", &STATUS_VTABLE),
+            StatusArray {
+                entries: Box::new([]),
+                velocity: Some(vstatus),
+                written: (0..2).map(|_| AtomicU64::new(0)).collect(),
+            },
+        );
+
+        // 3. Allocate and map 3 Xbox 64 KiB physical pages via `xmem`.
+        let mut pages = [0usize; 3];
+        let mut n = 3;
+        assert_eq!(
+            xmem::XMemAllocatePhysicalPages(0, &mut n, pages.as_mut_ptr()),
+            1
+        );
+        let mapped = xmem::XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            3 * PAGE,
+            0x2000 | 0x2040_0000, // reserve, 64 KiB pages
+            0,
+            0x04,
+        );
+        assert!(!mapped.is_null());
+        assert_eq!(
+            xmem::XMemMapPhysicalPages(mapped, 3, pages.as_ptr()),
+            mapped
+        );
+
+        // 4. Enqueue an uncompressed linear-memory read + a zlib-compressed
+        //    physical-page read spanning page boundaries, plus status entry 0.
+        let mut raw_out = vec![0u8; raw_plain.len()];
+        let raw_req = request(
+            0,
+            raw_out.as_mut_ptr().cast(),
+            raw_out.len(),
+            file_obj,
+            0,
+            raw_plain.len(),
+        );
+        let mut page_req = request(
+            ZLIB | PAGE_DESTINATION,
+            pages.as_mut_ptr().cast(),
+            page_plain.len(),
+            file_obj,
+            raw_plain.len() as u64,
+            page_packed.len(),
+        );
+        page_req.page_offset = 128;
+
+        enqueue(queue_obj, &raw_req);
+        enqueue(queue_obj, &page_req);
+        enqueue_status(queue_obj, status_obj, 0);
+
+        // Must stay pending prior to explicit `submit()` (zero premature submit).
+        assert_eq!(result(status_obj, 0), E_PENDING);
+        void(queue_obj, 0x30); // submit
+        assert_eq!(wait(status_obj, 0), S_OK);
+
+        assert_eq!(raw_out, raw_plain);
+        // SAFETY: all 3 pages are mapped read-write in `mapped`.
+        let mapped_bytes = unsafe { std::slice::from_raw_parts(mapped.cast::<u8>(), 3 * PAGE) };
+        assert!(mapped_bytes[..128].iter().all(|&b| b == 0));
+        assert_eq!(
+            mapped_bytes[128..128 + page_plain.len()],
+            page_plain[..]
+        );
+
+        // 5. Verify Rule 1 default: BCPack routes to pure `BcPackStubBackend` -> E_NOTIMPL.
+        let mut bc_out = [0u8; 16];
+        let bc_req = request(
+            7 << 1,
+            bc_out.as_mut_ptr().cast(),
+            bc_out.len(),
+            file_obj,
+            0,
+            16,
+        );
+        enqueue(queue_obj, &bc_req);
+        enqueue_status(queue_obj, status_obj, 1);
+        void(queue_obj, 0x30); // submit
+        assert_eq!(wait(status_obj, 1), E_NOTIMPL);
+
+        // 6. Clean up queue, COM objects, and physical pages.
+        void(queue_obj, 0x40); // close
+        let rel_q: extern "system" fn(*mut c_void) -> u32 = call(queue_obj, 0x10);
+        let rel_s: extern "system" fn(*mut c_void) -> u32 = call(status_obj, 0x10);
+        let rel_f: extern "system" fn(*mut c_void) -> u32 = call(file_obj, 0x10);
+        assert_eq!(rel_q(queue_obj), 0);
+        assert_eq!(rel_s(status_obj), 0);
+        assert_eq!(rel_f(file_obj), 0);
+        assert_eq!(
+            xmem::XMemMapPhysicalPages(mapped, 3, std::ptr::null()),
+            mapped
+        );
+        assert_eq!(xmem::XMemFreePhysicalPages(3, pages.as_ptr()), 1);
     }
 }

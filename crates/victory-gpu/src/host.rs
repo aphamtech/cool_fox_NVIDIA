@@ -36,6 +36,12 @@ pub(crate) fn texture_state(state: u32) -> u32 {
 /// ring of host descriptors is enough.
 const RTV_RING: u32 = 1024;
 
+/// Concrete D3D12 ReBAR / Staging Copy Ring upload allocator owned lazily by [`Host`].
+pub(crate) type HostRebarAllocator = crate::graphics::uma_bridge::RebarUploadAllocator<
+    std::sync::Arc<crate::graphics::uma_bridge::d3d12_backend::D3D12HeapBackend>,
+    crate::graphics::uma_bridge::d3d12_backend::D3D12CopyQueueBackend,
+>;
+
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
     queue: ID3D12CommandQueue,
@@ -61,6 +67,14 @@ pub(crate) struct Host {
     /// omits a view or sampler heap while using directly-indexed root signatures.
     fallback_view: OnceLock<Option<ID3D12DescriptorHeap>>,
     fallback_sampler: OnceLock<Option<ID3D12DescriptorHeap>>,
+    /// Subsystem A (`uma_bridge`) ReBAR + Staging Copy Ring upload allocator,
+    /// created lazily on first use so startup cost is zero when unused.
+    rebar: OnceLock<Option<std::sync::Arc<HostRebarAllocator>>>,
+    /// Subsystem B (`velocity_io`) D3D12 Async Compute Queue backend, created
+    /// lazily on first use.
+    compute: OnceLock<
+        Option<std::sync::Arc<crate::graphics::velocity_io::d3d12_compute::D3D12ComputeQueueBackend>>,
+    >,
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
@@ -824,7 +838,6 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
 static HOST: OnceLock<Option<Host>> = OnceLock::new();
 
 /// The host GPU if it is made already.
-#[cfg(feature = "diagnostics")]
 pub(crate) fn made_host() -> Option<&'static Host> {
     HOST.get()?.as_ref()
 }
@@ -840,6 +853,27 @@ pub(crate) fn host() -> Option<&'static Host> {
         }
     })
     .as_ref()
+}
+
+/// The widest wave this host's GPU runs (`WaveLaneCountMax`): 32 on NVIDIA,
+/// 64 on AMD RDNA. Initializes the host D3D12 device on first call so that
+/// host-dependent shader translation settings (`host_max_wave`, `host_rdna`,
+/// and `view_heap_limit`) match a live run. `None` without a host GPU.
+pub(crate) fn query_wave_max() -> Option<u32> {
+    let host = host()?;
+    let mut o1 = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+    // SAFETY: `o1` is a valid, properly sized D3D12 options1 output struct
+    // passed to `CheckFeatureSupport` on our live D3D12 device.
+    let ok = unsafe {
+        host.device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS1,
+                (&raw mut o1).cast(),
+                size_of_val(&o1) as u32,
+            )
+            .is_ok()
+    };
+    (ok && o1.WaveLaneCountMax > 0).then_some(o1.WaveLaneCountMax)
 }
 
 fn create() -> windows::core::Result<Host> {
@@ -984,6 +1018,8 @@ fn create() -> windows::core::Result<Host> {
             adapter,
             fallback_view: OnceLock::new(),
             fallback_sampler: OnceLock::new(),
+            rebar: OnceLock::new(),
+            compute: OnceLock::new(),
         })
     }
 }
@@ -994,6 +1030,81 @@ impl Host {
         let adapter = self.adapter.as_ref();
         // SAFETY: a plain query.
         adapter.map_or(0, |a| unsafe { a.CheckInterfaceSupport(&IDXGIDevice::IID) }.unwrap_or(0))
+    }
+
+    /// Lazily initializes and returns Subsystem A's [`HostRebarAllocator`].
+    pub(crate) fn rebar_allocator(&self) -> Option<&std::sync::Arc<HostRebarAllocator>> {
+        use crate::graphics::contracts::UploadAllocator;
+        use crate::graphics::uma_bridge::d3d12_backend::{
+            D3D12CopyQueueBackend, D3D12HeapBackend,
+        };
+        use crate::graphics::uma_bridge::{RebarAllocatorConfig, RebarUploadAllocator};
+
+        self.rebar
+            .get_or_init(|| {
+                let adapter1 = self
+                    .adapter
+                    .as_ref()
+                    .and_then(|a| a.cast::<IDXGIAdapter1>().ok());
+                let heap = std::sync::Arc::new(D3D12HeapBackend::new(
+                    self.device.clone(),
+                    adapter1.as_ref(),
+                ));
+                let copy = match D3D12CopyQueueBackend::new(std::sync::Arc::clone(&heap), 1) {
+                    Ok(copy) => copy,
+                    Err(err) => {
+                        tracing::warn!(%err, "uma_bridge: failed to create D3D12CopyQueueBackend");
+                        return None;
+                    }
+                };
+                match RebarUploadAllocator::new(heap, copy, RebarAllocatorConfig::default()) {
+                    Ok(alloc) => {
+                        let caps = alloc.capabilities();
+                        tracing::info!(
+                            gpu_upload_heap = caps.gpu_upload_heap_supported,
+                            is_uma = caps.is_uma,
+                            rebar_budget_mb = caps.rebar_budget_bytes >> 20,
+                            "uma_bridge: RebarUploadAllocator initialized"
+                        );
+                        Some(std::sync::Arc::new(alloc))
+                    }
+                    Err(err) => {
+                        tracing::warn!(%err, "uma_bridge: failed to initialize RebarUploadAllocator");
+                        None
+                    }
+                }
+            })
+            .as_ref()
+    }
+
+    /// Lazily initializes and returns Subsystem B's D3D12 Async Compute Queue backend.
+    pub(crate) fn compute_queue(
+        &self,
+    ) -> Option<
+        &std::sync::Arc<crate::graphics::velocity_io::d3d12_compute::D3D12ComputeQueueBackend>,
+    > {
+        use crate::graphics::contracts::GpuTimelineFence;
+        use crate::graphics::velocity_io::d3d12_compute::D3D12ComputeQueueBackend;
+
+        self.compute
+            .get_or_init(|| match D3D12ComputeQueueBackend::new(&self.device, 2) {
+                Ok(compute) => {
+                    if let Some(rebar) = self.rebar.get().and_then(Option::as_ref) {
+                        let copy_fence = rebar.copy_queue_backend().fence();
+                        compute.register_external_fence(
+                            copy_fence.queue_id(),
+                            copy_fence.raw_fence().clone(),
+                        );
+                    }
+                    tracing::info!("velocity_io: D3D12ComputeQueueBackend initialized");
+                    Some(std::sync::Arc::new(compute))
+                }
+                Err(err) => {
+                    tracing::warn!(%err, "velocity_io: failed to initialize D3D12ComputeQueueBackend");
+                    None
+                }
+            })
+            .as_ref()
     }
 }
 
@@ -1209,6 +1320,24 @@ pub(crate) struct HostList {
     /// and at the end, and where they are read back.
     #[cfg(feature = "diagnostics")]
     stamps: OnceLock<Option<(ID3D12QueryHeap, ID3D12Resource)>>,
+    /// Subsystem A (`uma_bridge`) coalescing barrier batcher and per-recording
+    /// `ResourceId -> ID3D12Resource` handle table (populated when `uma_bridge_enabled()`).
+    barrier_batcher: Mutex<UmaBarrierState>,
+}
+
+/// Per-command-list barrier coalescing state for Subsystem A (`uma_bridge`).
+struct UmaBarrierState {
+    batcher: crate::graphics::uma_bridge::CoalescingBarrierBatcher,
+    resources: std::collections::HashMap<crate::graphics::contracts::ResourceId, ID3D12Resource>,
+}
+
+impl Default for UmaBarrierState {
+    fn default() -> Self {
+        Self {
+            batcher: crate::graphics::uma_bridge::CoalescingBarrierBatcher::with_exact_state_tracking(),
+            resources: std::collections::HashMap::new(),
+        }
+    }
 }
 
 /// A list's prelude: an allocator and a closed list.
@@ -4112,6 +4241,7 @@ impl Host {
                 notes,
                 #[cfg(feature = "diagnostics")]
                 stamps: OnceLock::new(),
+                barrier_batcher: Mutex::default(),
             })
         }
     }
@@ -6263,6 +6393,7 @@ impl HostList {
 
     pub(crate) fn close(&self) {
         let _closing = crate::timeline::span("closing a host list");
+        self.flush_barriers();
         self.twins_to_depth();
         self.textures_back();
         let scratch = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -6272,6 +6403,7 @@ impl HostList {
         self.batches_common();
         self.card_budget_out();
         self.take_coming();
+        self.flush_barriers();
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
             let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
@@ -6324,6 +6456,12 @@ impl HostList {
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        {
+            use crate::graphics::contracts::BarrierBatcher;
+            let mut uma = self.barrier_batcher.lock().unwrap_or_else(|e| e.into_inner());
+            uma.batcher.reset();
+            uma.resources.clear();
+        }
         #[cfg(feature = "diagnostics")]
         self.indirects.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
@@ -6391,6 +6529,21 @@ impl HostList {
                 None
             }
             std::collections::hash_map::Entry::Occupied(mut o) => {
+                let current = o.get().1;
+                if crate::graphics::uma_bridge_enabled() {
+                    use crate::graphics::contracts::ResourceStateFlags;
+                    let cur_flags = ResourceStateFlags::from_xbox_raw(current);
+                    let want_flags = ResourceStateFlags::from_xbox_raw(wanted);
+                    // Strip redundant read-to-read subset transitions while keeping
+                    // `HostList::states` at `current`, so later transitions emit the
+                    // exact `StateBefore` matching the live D3D12 resource state.
+                    if cur_flags.is_read_only()
+                        && want_flags.is_read_only()
+                        && cur_flags.contains(want_flags)
+                    {
+                        return None;
+                    }
+                }
                 let before = std::mem::replace(&mut o.get_mut().1, wanted);
                 if before != wanted {
                     self.changed_something();
@@ -6420,6 +6573,7 @@ impl HostList {
         };
         drop(states);
         if let Some(before) = before {
+            self.flush_barriers();
             let barrier = transition(
                 &copy.texture,
                 D3D12_RESOURCE_STATES(before as i32),
@@ -6428,6 +6582,104 @@ impl HostList {
             // SAFETY: an open list and a live texture.
             unsafe { self.list.ResourceBarrier(&[barrier]) };
         }
+    }
+
+    /// Queues a transition barrier into this list's [`CoalescingBarrierBatcher`].
+    pub(crate) fn push_transition_barrier(
+        &self,
+        texture: &ID3D12Resource,
+        subresource: u32,
+        before: u32,
+        after: u32,
+    ) {
+        use crate::graphics::contracts::{
+            BarrierBatcher, ResourceId, ResourceStateFlags, SubresourceIndex,
+            TransitionBarrierDesc,
+        };
+        let rid = ResourceId(texture.as_raw() as usize as u64);
+        let mut uma = self.barrier_batcher.lock().unwrap_or_else(|e| e.into_inner());
+        uma.resources.entry(rid).or_insert_with(|| texture.clone());
+        uma.batcher.push_transition(TransitionBarrierDesc {
+            resource: rid,
+            subresource: SubresourceIndex(subresource),
+            before: ResourceStateFlags::from_xbox_raw(before),
+            after: ResourceStateFlags::from_xbox_raw(after),
+        });
+    }
+
+    /// Queues an aliasing barrier into this list's [`CoalescingBarrierBatcher`].
+    /// Only valid for true host-placed/reserved resources sharing an `ID3D12Heap` (or `(None, None)`).
+    #[allow(dead_code)]
+    pub(crate) fn push_aliasing_barrier(
+        &self,
+        before: Option<&ID3D12Resource>,
+        after: Option<&ID3D12Resource>,
+    ) {
+        use crate::graphics::contracts::{AliasingBarrierDesc, BarrierBatcher, ResourceId};
+        let mut uma = self.barrier_batcher.lock().unwrap_or_else(|e| e.into_inner());
+        let before_id = before.map(|r| {
+            let rid = ResourceId(r.as_raw() as usize as u64);
+            uma.resources.entry(rid).or_insert_with(|| r.clone());
+            rid
+        });
+        let after_id = after.map(|r| {
+            let rid = ResourceId(r.as_raw() as usize as u64);
+            uma.resources.entry(rid).or_insert_with(|| r.clone());
+            rid
+        });
+        if before_id.is_some() && before_id == after_id {
+            return;
+        }
+        uma.batcher.push_aliasing(AliasingBarrierDesc {
+            before: before_id,
+            after: after_id,
+        });
+    }
+
+    /// Queues a UAV barrier into this list's [`CoalescingBarrierBatcher`].
+    pub(crate) fn push_uav_barrier(&self, resource: Option<&ID3D12Resource>) {
+        use crate::graphics::contracts::{BarrierBatcher, ResourceId, UavBarrierDesc};
+        let mut uma = self.barrier_batcher.lock().unwrap_or_else(|e| e.into_inner());
+        let rid = resource.map(|r| {
+            let id = ResourceId(r.as_raw() as usize as u64);
+            uma.resources.entry(id).or_insert_with(|| r.clone());
+            id
+        });
+        uma.batcher.push_uav(UavBarrierDesc { resource: rid });
+    }
+
+    /// Updates [`crate::resource::record_placed_aliasing_copies`] ownership tracking
+    /// for `title_resource`.
+    ///
+    /// Note: `HostTexture::texture` is currently backed by distinct committed host
+    /// resources (`CreateCommittedResource`), not host-placed resources on a shared
+    /// `ID3D12Heap`. Direct3D 12 rejects `D3D12_RESOURCE_BARRIER_TYPE_ALIASING` on
+    /// committed resources with `E_INVALIDARG (0x80070057)` at `Close()`, so we only
+    /// emit a global UAV ordering barrier on detected Xbox placed-heap ownership
+    /// changes rather than passing committed `ID3D12Resource` handles to an aliasing
+    /// barrier.
+    pub(crate) fn record_placed_aliasing(&self, title_resource: crate::object::This) {
+        let pairs = crate::resource::record_placed_aliasing_copies(title_resource);
+        if !pairs.is_empty() {
+            self.push_uav_barrier(None);
+        }
+    }
+
+    /// Flushes any pending barriers accumulated in this list's
+    /// [`CoalescingBarrierBatcher`] into a single `ResourceBarrier` call.
+    pub(crate) fn flush_barriers(&self) -> usize {
+        if !crate::graphics::uma_bridge_enabled() {
+            return 0;
+        }
+        use crate::graphics::contracts::BarrierBatcher;
+        use crate::graphics::uma_bridge::D3D12CommandListBarrierSink;
+        let mut uma = self.barrier_batcher.lock().unwrap_or_else(|e| e.into_inner());
+        if uma.batcher.pending_len() == 0 {
+            return 0;
+        }
+        let UmaBarrierState { batcher, resources } = &mut *uma;
+        let mut sink = D3D12CommandListBarrierSink::new(&self.list, resources);
+        batcher.flush(&mut sink)
     }
 
     /// A use of title texture `resource` about to be recorded, if it is a

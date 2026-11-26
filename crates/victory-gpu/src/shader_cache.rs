@@ -100,16 +100,40 @@ pub(crate) fn translation() -> [u8; 32] {
     build()
 }
 
+/// The widest wave this host's GPU runs (`WaveLaneCountMax`): 32 on NVIDIA,
+/// 64 on AMD RDNA. A run translates shaders for what its device reports and
+/// the cache keys on it, so precompilation queries the same value.
+/// `None` without a host GPU.
+pub fn host_wave_max() -> Option<u32> {
+    crate::host::query_wave_max()
+}
+
+/// Translates `container` into the shader cache unless it is already present,
+/// returning `(emitted_dxil, was_cached)`.
+///
+/// The hit flag is tracked per call rather than via global counters, so
+/// parallel precompile workers observe exact hit/translated counts without
+/// cross-thread races.
+pub fn precompile_shader(container: &[u8]) -> Result<(Vec<u8>, bool), String> {
+    let _ = crate::host::host();
+    let ran = AtomicBool::new(false);
+    let translate = |c: &[u8]| {
+        ran.store(true, Ordering::Relaxed);
+        victory_shader::emit::translate(c).map_err(|e| e.to_string())
+    };
+    let shader = match CACHE.get() {
+        Some(cache) => cached(cache, &build(), container, translate)?,
+        None => translate(container)?,
+    };
+    Ok((shader.dxil, !ran.load(Ordering::Relaxed)))
+}
+
 /// Puts the translation of `container` into the cache before any title asks
 /// for it (`victory shaders`): whether it was there already, or why it does
 /// not translate. The host is opened first, as a run does: what the card
 /// can do decides the form of some programs.
 pub fn precompile(container: &[u8]) -> Result<bool, String> {
-    let _ = crate::host::host();
-    let misses = MISSES.load(Ordering::Relaxed);
-    host_shader(container)?;
-    // (Counts other threads' misses too: the caller only adds them up.)
-    Ok(MISSES.load(Ordering::Relaxed) == misses)
+    precompile_shader(container).map(|(_, hit)| hit)
 }
 
 /// The translation of a console shader container, from the cache when

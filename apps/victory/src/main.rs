@@ -5,6 +5,8 @@
 
 mod census;
 mod inspect;
+mod precompile;
+mod progress;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod replay;
 mod run;
@@ -96,6 +98,32 @@ enum Command {
         #[arg(long)]
         warm: Option<PathBuf>,
     },
+    /// Translate every shader found into the shader cache a run reads, with
+    /// an optional progress window, so a first launch does not translate them
+    /// while the loading screen waits. Run it with the same environment (and
+    /// the same build) as the run.
+    Precompile {
+        paths: Vec<PathBuf>,
+        /// The widest wave the host GPU runs, in lanes (32 for NVIDIA, 64
+        /// for AMD RDNA): what a run translates its shaders for. Default:
+        /// ask the host GPU.
+        #[arg(long, value_name = "LANES")]
+        host_wave: Option<u32>,
+        /// Worker threads (default: every logical core).
+        #[arg(long)]
+        jobs: Option<usize>,
+        /// Fail (exit status 1) when a shader could not be translated.
+        #[arg(long)]
+        strict: bool,
+        /// Check every emitted shader with dxil.dll's validator
+        /// (`VICTORY_DXIL`, else the newest Windows SDK's) and report the
+        /// ones the host's driver would refuse.
+        #[arg(long)]
+        validate: bool,
+        /// No progress window (it shows the counts, progress bar, and rate).
+        #[arg(long)]
+        no_gui: bool,
+    },
     /// Translate every shader found (as `translate` finds them) into the
     /// shader cache, so that no run has to: a few minutes, once per change
     /// of the translator.
@@ -142,6 +170,12 @@ enum Command {
         /// The console model the title sees (device type, memory).
         #[arg(long, value_enum, default_value_t = Console::SeriesX)]
         console: Console,
+        /// Translate the title's shaders into the shader cache before the
+        /// title starts (opening the precompile progress UI), so the loading
+        /// screen does not wait for them. Already-cached shaders are skipped,
+        /// and closing the window skips remaining shaders and launches now.
+        #[arg(long)]
+        precompile: bool,
         /// Arguments for the title, after `--` (it reads the whole command
         /// line; a title that relaunches itself passes some).
         #[arg(last = true)]
@@ -213,6 +247,22 @@ fn main() -> Result<()> {
             }
             translate::run(paths, validate, pipelines, list, jobs)
         }
+        Command::Precompile {
+            paths,
+            host_wave,
+            jobs,
+            strict,
+            validate,
+            no_gui,
+        } => precompile::run(precompile::Options {
+            paths,
+            host_wave,
+            jobs,
+            strict,
+            gui: !no_gui,
+            validate,
+            allow_skip: false,
+        }),
         Command::Shaders { paths, jobs } => translate::precompile(paths, jobs),
         #[cfg(windows)]
         Command::Warm { jobs, limit, again, used, these } => warm::run(jobs, limit, again, used, these),
@@ -222,10 +272,11 @@ fn main() -> Result<()> {
             strict,
             execute,
             console,
+            precompile,
             title_args,
         } => {
             victory_hle::runtime::set_title_args(title_args);
-            run::run(&exe, unimplemented, strict, execute, console)
+            run::run(&exe, unimplemented, strict, execute, console, precompile)
         }
         #[cfg(all(windows, feature = "diagnostics"))]
         Command::Replay(options) => replay::run(options),

@@ -42,6 +42,7 @@ pub fn run(
     strict: bool,
     execute: bool,
     console: Console,
+    precompile: bool,
 ) -> Result<()> {
     use std::sync::Arc;
     use victory_hle::{HleResolver, HostPolicy};
@@ -53,6 +54,27 @@ pub fn run(
     // A title that relaunched itself: the old process must be gone first.
     victory_hle::modules::lifecycle::wait_for_previous();
     let cfg = victory_core::Config::load()?;
+    if precompile {
+        // The title's shaders live beside its executable and in its archives:
+        // the game folder is the whole of it. Run before mapping the title's
+        // PE image so temporary read buffers are freed first.
+        let paths: Vec<std::path::PathBuf> = match &cfg.game_dir {
+            Some(dir) => vec![dir.clone()],
+            None => exe.parent().map(|p| vec![p.to_path_buf()]).unwrap_or_default(),
+        };
+        let options = crate::precompile::Options {
+            paths,
+            host_wave: None,
+            jobs: None,
+            strict: false,
+            gui: true,
+            validate: false,
+            allow_skip: true,
+        };
+        if let Err(e) = crate::precompile::run(options) {
+            eprintln!("precompile: {e:#} (the run translates them as it goes)");
+        }
+    }
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
     let prepared = victory_loader::prepare(&original)?;
     let hash = prepared.original_hash.to_hex();
@@ -529,6 +551,6 @@ mod cpu_check_tests {
 }
 
 #[cfg(not(windows))]
-pub fn run(_: &Path, _: Unimplemented, _: bool, _: bool, _: Console) -> Result<()> {
+pub fn run(_: &Path, _: Unimplemented, _: bool, _: bool, _: Console, _: bool) -> Result<()> {
     anyhow::bail!("running titles requires Windows")
 }

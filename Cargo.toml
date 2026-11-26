@@ -43,6 +43,14 @@ walkdir = "2.5.1"
 tempfile = "3.27.0"
 # Opus decoding for the console's audio decoder (BSD-3-Clause, pure Rust).
 opus-pure = "0.2.4"
+# Lock-free queues for zero-stall render/IO/GPU submission pipelines.
+crossbeam-queue = "0.3.12"
+# Stack-allocated small vectors for coalesced barrier batches and aliasing overlap results.
+smallvec = "1.15.1"
+# Pure-Rust LZ4 block/frame decompression for Velocity I/O DecompressionBackend.
+lz4_flex = { version = "0.11.3", default-features = false, features = ["std", "frame"] }
+# Micro-benchmark harness for Subsystem A (uma_bridge) and Subsystem B (velocity_io).
+criterion = { version = "0.5.1", default-features = false, features = ["cargo_bench_support"] }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

@@ -37,6 +37,34 @@ fn host_gpu_failed(what: &str) -> ! {
     unreachable!("the process has ended")
 }
 
+/// The widest wave this host's GPU runs (32 on NVIDIA, 64 on AMD RDNA), the
+/// size a run translates the title's shaders for; `None` when no Direct3D 12
+/// device can be asked.
+pub fn host_wave_max() -> Option<u32> {
+    #[cfg(windows)]
+    {
+        victory_gpu::shader_cache::host_wave_max()
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+/// Translates the console shader `container` into the shader cache a run
+/// reads (with [`use_shader_cache`]), returning `(emitted_dxil, was_cached)`.
+pub fn precompile_shader(container: &[u8]) -> Result<(Vec<u8>, bool), String> {
+    #[cfg(windows)]
+    {
+        victory_gpu::shader_cache::precompile_shader(container)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = container;
+        Err("no shader translation on this host".to_owned())
+    }
+}
+
 /// Translates `container` into the cache ([`use_shader_cache`]) ahead of
 /// any run: whether it was there already, or why it does not translate.
 pub fn precompile(container: &[u8]) -> Result<bool, String> {

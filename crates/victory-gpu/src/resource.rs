@@ -98,6 +98,104 @@ pub(crate) struct ResourceDesc {
     flags: u32,
 }
 
+#[cfg(test)]
+impl HeapDesc {
+    pub(crate) fn for_test(size: u64) -> Self {
+        Self {
+            size,
+            properties: HeapProperties {
+                kind: 1,
+                cpu_pages: 0,
+                pool: 0,
+                creation_nodes: 1,
+                visible_nodes: 1,
+            },
+            alignment: KIB_64,
+            flags: 0,
+        }
+    }
+}
+
+#[cfg(test)]
+impl ResourceDesc {
+    pub(crate) fn buffer_for_test(width: u64) -> Self {
+        Self {
+            dimension: BUFFER,
+            alignment: KIB_64,
+            width,
+            height: 1,
+            depth_or_array_size: 1,
+            mip_levels: 1,
+            format: 0,
+            sample_count: 1,
+            sample_quality: 0,
+            layout: 1,
+            flags: 0,
+        }
+    }
+}
+
+/// Thread-safe placed-resource aliasing tracker registry for Subsystem A (`uma_bridge`).
+static UMA_ALIASING: std::sync::OnceLock<
+    std::sync::Mutex<crate::graphics::uma_bridge::IntervalAliasingTracker>,
+> = std::sync::OnceLock::new();
+
+/// Returns the global [`IntervalAliasingTracker`] tracking `CreatePlacedResource`
+/// and `CreatePlacedResourceX` / `create_at_address` heap intervals.
+pub(crate) fn uma_aliasing_tracker()
+-> &'static std::sync::Mutex<crate::graphics::uma_bridge::IntervalAliasingTracker> {
+    UMA_ALIASING.get_or_init(|| {
+        std::sync::Mutex::new(crate::graphics::uma_bridge::IntervalAliasingTracker::new())
+    })
+}
+
+/// Records an access to `this`, returning the minimal aliasing barriers needed
+/// for any overlapping placed resources evicted by `this`.
+#[allow(dead_code)]
+pub(crate) fn record_placed_access(
+    this: This,
+) -> smallvec::SmallVec<[crate::graphics::contracts::AliasingBarrierDesc; 4]> {
+    if this.is_null() {
+        return smallvec::SmallVec::new();
+    }
+    use crate::graphics::contracts::{AliasingTracker, ResourceId};
+    uma_aliasing_tracker()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .on_resource_access(ResourceId(this as usize as u64))
+}
+
+/// Atomically records an access to `this` and resolves already-created host texture
+/// copies (`made_copy`, without lazily creating new GPU textures) while holding
+/// `UMA_ALIASING`. Holding the tracker lock prevents `Drop for Resource` from freeing
+/// an evicted resource before its `Arc<HostTexture>` is cloned (avoiding UAF).
+#[cfg(windows)]
+pub(crate) fn record_placed_aliasing_copies(
+    this: This,
+) -> smallvec::SmallVec<[(std::sync::Arc<HostTexture>, std::sync::Arc<HostTexture>); 4]> {
+    let mut resolved = smallvec::SmallVec::new();
+    if this.is_null() {
+        return resolved;
+    }
+    use crate::graphics::contracts::{AliasingTracker, ResourceId};
+    let mut tracker = uma_aliasing_tracker()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let barriers = tracker.on_resource_access(ResourceId(this as usize as u64));
+    for desc in barriers {
+        let before = desc
+            .before
+            .and_then(|id| made_copy(id.0 as usize as This));
+        let after = desc
+            .after
+            .and_then(|id| made_copy(id.0 as usize as This));
+        if let (Some(b), Some(a)) = (before, after) {
+            resolved.push((b, a));
+        }
+    }
+    resolved
+}
+
 #[cfg(windows)]
 impl ResourceDesc {
     /// The texture of this one's levels from `base` on.
@@ -2715,12 +2813,65 @@ fn hand_out_resource(
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
         crate::shadow::register(at, resource.data() as u64, desc.width);
     }
+    // Subsystem A (`uma_bridge`): track placed and virtual-address resources for
+    // minimal D3D12 aliasing barrier injection and Rule 2 unregistration on drop.
+    let aliasing_range = match resource.backing {
+        Backing::Placed { heap, offset } => {
+            let size = footprint(&desc).map_or(desc.width.max(1), |f| f.size);
+            (size > 0).then_some(crate::graphics::contracts::HeapRange {
+                heap_id: crate::graphics::contracts::HeapId(heap as usize as u64),
+                offset,
+                size,
+            })
+        }
+        Backing::Address(ptr) => {
+            let size = footprint(&desc).map_or(desc.width.max(1), |f| f.size);
+            (size > 0).then_some(crate::graphics::contracts::HeapRange {
+                heap_id: crate::graphics::contracts::HeapId(0),
+                offset: ptr as usize as u64,
+                size,
+            })
+        }
+        Backing::Committed(_) => None,
+    };
+    if let Some(range) = aliasing_range {
+        use crate::graphics::contracts::{AliasingTracker, ResourceId};
+        let rid = ResourceId(std::ptr::from_ref::<Resource>(&resource) as usize as u64);
+        let _ = uma_aliasing_tracker()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .register_placed(rid, range);
+    }
     object::hand_out(RESOURCE, resource, iid, &RESOURCE_IIDS, out)
+}
+
+#[cfg(not(windows))]
+impl Drop for Resource {
+    fn drop(&mut self) {
+        if matches!(self.backing, Backing::Placed { .. } | Backing::Address(_)) {
+            use crate::graphics::contracts::{AliasingTracker, ResourceId};
+            let addr = std::ptr::from_ref::<Resource>(self) as usize as u64;
+            uma_aliasing_tracker()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .unregister_placed(ResourceId(addr));
+        }
+    }
 }
 
 #[cfg(windows)]
 impl Drop for Resource {
     fn drop(&mut self) {
+        // Rule 2 unmapped VA guard: remove destroyed placed/VA resources from the
+        // aliasing tracker so later barriers can never reference freed handles.
+        if matches!(self.backing, Backing::Placed { .. } | Backing::Address(_)) {
+            use crate::graphics::contracts::{AliasingTracker, ResourceId};
+            let addr = std::ptr::from_ref::<Resource>(self) as usize as u64;
+            uma_aliasing_tracker()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .unregister_placed(ResourceId(addr));
+        }
         // Out of the table of textures first: the sweep looks at the ones
         // in it, under its lock.
         if self.desc.dimension != BUFFER {

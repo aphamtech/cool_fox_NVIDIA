@@ -35,6 +35,7 @@ mod draw;
 pub mod dxgi;
 pub mod fence;
 pub mod frame;
+pub mod graphics;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod book;
 #[cfg(windows)]
@@ -117,3 +118,39 @@ pub use watch::{
     title_memory_remapping, title_memory_splitting, title_memory_unmapping, title_memory_written,
     writing as kernel_will_write,
 };
+
+/// Returns the lazily-initialized host ReBAR / Staging Copy Ring [`UploadAllocator`]
+/// when a host D3D12 device is already active, allowing `velocity_io` to share the
+/// GPU upload allocator without forcing premature D3D12 device creation.
+#[must_use]
+pub fn shared_rebar_allocator()
+-> Option<std::sync::Arc<dyn graphics::contracts::UploadAllocator>> {
+    #[cfg(windows)]
+    {
+        host::made_host()
+            .and_then(|h| h.rebar_allocator().cloned())
+            .map(|a| a as std::sync::Arc<dyn graphics::contracts::UploadAllocator>)
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+/// Returns the lazily-initialized host D3D12 Async Compute Queue backend when a
+/// host D3D12 device is already active, allowing `velocity_io` to dispatch GPU
+/// decompression/passthrough copy work over `D3D12_COMMAND_LIST_TYPE_COMPUTE`.
+#[must_use]
+pub fn shared_compute_queue()
+-> Option<std::sync::Arc<dyn graphics::contracts::ComputeQueueBackend>> {
+    #[cfg(windows)]
+    {
+        host::made_host()
+            .and_then(|h| h.compute_queue().cloned())
+            .map(|c| c as std::sync::Arc<dyn graphics::contracts::ComputeQueueBackend>)
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
