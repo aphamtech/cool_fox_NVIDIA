@@ -39,14 +39,8 @@ if not exist "%VICTORY_TITLE_EXE%" (
     goto :fail
 )
 
-set "runner=%VICTORY_REPO%\victory-3d-rtx-pareto-residency.exe"
+rem "runner=%VICTORY_REPO%\victory-3d-rtx-pareto-residency.exe"
 if not exist "%runner%" set "runner=%VICTORY_RELEASE%"
-if not exist "%runner%" set "runner=%VICTORY_DIAG%"
-if not exist "%runner%" (
-    echo Building victory ^(diag, diagnostics^), this takes a minute...
-    cargo build --locked --profile diag -p victory --features diagnostics || goto :fail
-    set "runner=%VICTORY_DIAG%"
-)
 
 set "VICTORY_UMA_BRIDGE=1"
 set "VICTORY_VELOCITY_IO=1"

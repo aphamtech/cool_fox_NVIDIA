@@ -5711,6 +5711,10 @@ impl Host {
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         let was_working = working(true);
         submitting(1, runs.len());
+        // Descriptors the title copied into placed heaps directly: start
+        // scanning and mirroring on the background thread right away so it
+        // overlaps with card_steps, flight waits, refreshes, and card_before.
+        let heaps_synced = crate::descriptor::begin_sync_heaps();
         #[cfg(feature = "diagnostics")]
         let ahead = Split::begin();
         #[cfg(feature = "diagnostics")]
@@ -5741,9 +5745,6 @@ impl Host {
         }
         #[cfg(feature = "diagnostics")]
         ahead.part(13);
-        // Descriptors the title copied into placed heaps directly, before
-        // command lists that index those slots are submitted.
-        let heaps_synced = crate::descriptor::begin_sync_heaps();
         // That list runs first, and is one of the submission's from here on.
         let with: Vec<&HostList>;
         let runs = match &own {
