@@ -90,8 +90,32 @@ impl Tally {
     }
 }
 
-/// Walks `paths` and returns candidate `(path, file_size)` pairs, skipping
-/// Victory's own cache/data directories and files larger than [`MAX_FILE`].
+/// Returns true if `path` is a Victory-generated cache or shader-dump directory
+/// sitting inside a scanned game folder (e.g. when `VICTORY_CACHE_DIR` is
+/// overridden to a separate location by a launcher script such as
+/// `Play-VIctory.cmd`, leaving an existing `<game_dir>\cache` behind).
+fn is_victory_derived_dir(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let lower = name.to_ascii_lowercase();
+    if lower.starts_with("dump-dxil") {
+        return true;
+    }
+    if lower == "cache" {
+        return path.join("shaders").is_dir()
+            || path.join("pipelines").is_dir()
+            || path.join("images").is_dir();
+    }
+    if lower == "shaders" && path.join("00").is_dir() && path.join("ff").is_dir() {
+        return true;
+    }
+    false
+}
+
+/// Walks `paths` and returns candidate `(path, file_size)` pairs, pruning
+/// Victory's own cache/data/dump directories and skipping files larger than
+/// [`MAX_FILE`].
 fn collect_candidates(
     paths: &[PathBuf],
     cache_dir: &Path,
@@ -103,10 +127,17 @@ fn collect_candidates(
         if cancelled() {
             break;
         }
-        for entry in walkdir::WalkDir::new(root)
-            .into_iter()
-            .filter_map(Result::ok)
-        {
+        let walker = walkdir::WalkDir::new(root).into_iter().filter_entry(|e| {
+            let path = e.path();
+            if path.starts_with(cache_dir) || path.starts_with(data_dir) {
+                return false;
+            }
+            if e.depth() > 0 && e.file_type().is_dir() && is_victory_derived_dir(path) {
+                return false;
+            }
+            true
+        });
+        for entry in walker.filter_map(Result::ok) {
             if cancelled() {
                 break;
             }
@@ -117,13 +148,7 @@ fn collect_candidates(
             if len == 0 || len > MAX_FILE {
                 continue;
             }
-            // Our own cache and saves can sit inside the game folder, and
-            // their files are not the title's shaders.
-            let path = entry.path();
-            if path.starts_with(cache_dir) || path.starts_with(data_dir) {
-                continue;
-            }
-            files.push((path.to_path_buf(), len));
+            files.push((entry.path().to_path_buf(), len));
         }
     }
     files
@@ -218,6 +243,16 @@ pub fn run(options: Options) -> Result<()> {
             }
             continue;
         };
+        // Skip Victory's own cached host shader entries (`VSH<digit>` magic, e.g.
+        // `VSH1`, `VSH2`), which embed already-translated PC DXIL containers
+        // rather than Xbox console code.
+        if data.len() >= 4 && &data[..3] == b"VSH" && data[3].is_ascii_digit() {
+            if let Some(p) = &progress {
+                p.add_bytes(*file_len);
+                p.finish_file();
+            }
+            continue;
+        }
         let containers = sources(&data);
         if containers.is_empty() {
             if let Some(p) = &progress {
@@ -499,6 +534,40 @@ mod tests {
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].0, game_file);
         assert_eq!(found[0].1, 10);
+    }
+
+    #[test]
+    fn collect_candidates_prunes_nested_victory_cache_when_cache_dir_differs() {
+        let root = std::env::temp_dir().join(format!(
+            "victory-precompile-override-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let nested_shaders = root.join("cache").join("shaders").join("00");
+        let nested_dump = root.join("cache").join("dump-dxil");
+        let top_dump = root.join("dump-dxil2");
+        let external_cache = root.join("external_cache_pareto");
+        let external_data = root.join("external_data");
+        std::fs::create_dir_all(&nested_shaders).unwrap();
+        std::fs::create_dir_all(&nested_dump).unwrap();
+        std::fs::create_dir_all(&top_dump).unwrap();
+
+        let game_file = root.join("shaders.rpf");
+        std::fs::write(&game_file, b"SGD5_dummy").unwrap();
+        std::fs::write(nested_shaders.join("deadbeef"), b"VSH1_DXBC").unwrap();
+        std::fs::write(nested_dump.join("dumped.dxil"), b"DXBC_pc").unwrap();
+        std::fs::write(top_dump.join("dumped2.dxil"), b"DXBC_pc").unwrap();
+
+        let found = collect_candidates(
+            std::slice::from_ref(&root),
+            &external_cache,
+            &external_data,
+            || false,
+        );
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].0, game_file);
     }
 
     #[test]
