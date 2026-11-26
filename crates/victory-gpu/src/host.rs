@@ -9018,6 +9018,69 @@ struct Presenter {
     panel: panel::Panel,
 }
 
+/// Per-frame real `Present()` timestamp and frametime logger, enabled when
+/// `VICTORY_FRAMETIMES=<path>` is set. Zero overhead when unset; when enabled,
+/// formats into a stack buffer and writes one line per frame directly so hard
+/// process teardown never loses buffered samples.
+struct FrameTimeLog {
+    file: std::fs::File,
+    start: std::time::Instant,
+    last: Option<std::time::Instant>,
+    frame: u64,
+}
+
+impl FrameTimeLog {
+    fn from_env() -> Option<Self> {
+        let path = std::env::var_os("VICTORY_FRAMETIMES")?;
+        if path.is_empty() {
+            return None;
+        }
+        let path = std::path::PathBuf::from(path);
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let mut file = match std::fs::File::create(&path) {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "could not create VICTORY_FRAMETIMES file"
+                );
+                return None;
+            }
+        };
+        use std::io::Write;
+        let _ = file.write_all(b"frame,elapsed_us,frametime_us\n");
+        Some(Self {
+            file,
+            start: std::time::Instant::now(),
+            last: None,
+            frame: 0,
+        })
+    }
+
+    #[inline]
+    fn record(&mut self) {
+        use std::io::Write;
+        let now = std::time::Instant::now();
+        self.frame += 1;
+        let elapsed_us = now.duration_since(self.start).as_micros() as u64;
+        let dt_us = self
+            .last
+            .map_or(0, |prev| now.duration_since(prev).as_micros() as u64);
+        self.last = Some(now);
+        let mut buf = [0u8; 96];
+        let mut cursor = std::io::Cursor::new(&mut buf[..]);
+        if writeln!(cursor, "{},{},{}", self.frame, elapsed_us, dt_us).is_ok() {
+            let len = cursor.position() as usize;
+            let _ = self.file.write_all(&buf[..len]);
+        }
+    }
+}
+
 /// The frame rate, shown in the window's caption every second and logged
 /// every few seconds.
 struct Meter {
@@ -9029,6 +9092,7 @@ struct Meter {
     logged: std::time::Instant,
     /// The caption the window had, once read.
     caption: Option<Vec<u16>>,
+    frametimes: Option<FrameTimeLog>,
 }
 
 impl Meter {
@@ -9042,6 +9106,7 @@ impl Meter {
             drawn: crate::draw::drawn(),
             logged: now,
             caption: None,
+            frametimes: FrameTimeLog::from_env(),
         }
     }
 
@@ -9053,6 +9118,9 @@ impl Meter {
 
     /// Counts a presented frame.
     fn frame(&mut self, hwnd: HWND) {
+        if let Some(log) = self.frametimes.as_mut() {
+            log.record();
+        }
         #[cfg(feature = "diagnostics")]
         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
         #[cfg(feature = "diagnostics")]
