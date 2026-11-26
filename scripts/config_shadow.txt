@@ -1,0 +1,179 @@
+SHADOW-RELATED VICTORY_* SWITCHES
+=================================
+Every switch below is read with std::env::var / var_os at the place named.
+A switch not set uses its default. VICTORY_SHADOW_SCALE is case-insensitive;
+the others are compared as written.
+
+Copy-paste block (cmd.exe), all at their defaults:
+-------------------------------------------------
+  set "VICTORY_SHADOW_SCALE=2"
+  set "VICTORY_SHADOW_MAX_DIM=8192"
+  set "VICTORY_DEPTH_TWINS=1"
+  rem ray-traced shadows (off by default, costs about 40 ms a frame):
+  rem set "VICTORY_BVH_BUILDER=1"
+
+
+1. SHADOW MAP RESOLUTION
+------------------------
+
+VICTORY_SHADOW_SCALE
+  What:   Per-axis resolution multiplier for the title's shadow maps: the
+          host texture is made `scale` times wider and taller, so scale=2 is
+          2x2 = 4x the pixels, scale=3 is 9x, scale=4 is 16x. The shadow
+          pass' viewports and scissors, its clears and its copies are scaled
+          to match (draw.rs apply_viewports/apply_scissors, list.rs), so the
+          title keeps its own UV math and only the texel density changes.
+  Read:   crates/victory-gpu/src/resource.rs:446 (parse at :451)
+  Values: 0 | 1 | 1x | off | native      -> 1  (native, no upscaling)
+          2 | 2x | 4x | high | ultra     -> 2  (4x pixels)  [default]
+          3 | 9x                         -> 3  (9x pixels)
+          4 | 16x                        -> 4  (16x pixels)
+          any other integer              -> clamped to 1..=4
+          anything unparsable            -> 2
+          (unset)                        -> 2
+  Note:   "4x", "9x", "16x" name the PIXEL count; the per-axis factor is
+          2, 3, 4.
+  Side effect: while this is above 1, point-filtered comparison samplers are
+          upgraded to hardware bilinear PCF (min/mag linear, mip point), so a
+          point shadow sampler becomes a 4-tap soft comparison. This applies
+          to every such sampler, not only to maps that were actually scaled.
+          Read at crates/victory-gpu/src/sampler.rs:51.
+  Seen in the log as: "shadow map render resolution increased
+          from=WxH to=WxH" (first 8 maps and every power of two after), and
+          in the diagnostics line "Shadows=Nx (SxS, scaled_maps=K)"
+          (crates/victory-gpu/src/host.rs:9483, built in fsr.rs:596).
+  Set by: Play-VIctory.cmd:58 (=2), scripts/launch-game-fast.bat:73 (=1),
+          scripts/bench_fps.py:376 (=2).
+  Which textures qualify (shadow_scale_for_desc, resource.rs:475):
+          - 2D textures (dimension 3)
+          - ALLOW_DEPTH_STENCIL set, ALLOW_RENDER_TARGET NOT set
+          - DENY_SHADER_RESOURCE NOT set (they are sampled)
+          - sample_count == 1
+          - both sides powers of two, both >= 256
+          - longer side at most 4x the shorter
+          - scaled size within VICTORY_SHADOW_MAX_DIM
+          Anything else (the screen depth buffer at 1920x1080, the shadow
+          mask, cube maps under 256) keeps its native size.
+
+VICTORY_SHADOW_MAX_DIM
+  What:   The largest width or height, in texels, an upscaled shadow map may
+          reach. A map whose scaled size would exceed it is left at native
+          resolution instead (no partial clamp).
+  Read:   crates/victory-gpu/src/resource.rs:465
+  Values: integer, clamped to 2048..=16384   [default 8192]
+  Use:    With the default, a 4096-wide atlas scales to 8192 at scale 2;
+          a 8192-wide atlas is left native. Raise to 16384 to scale one, at
+          4x the memory and fill per such map.
+
+
+2. SHADOW MAPS THE TITLE ALSO WRITES AS UNORDERED ACCESS
+--------------------------------------------------------
+
+VICTORY_DEPTH_TWINS
+  What:   The console allows a depth texture to be unordered access too; PC
+          D3D12 does not. The layer gives such a texture a colour twin and
+          copies/draws between the two. The title's shadow maps ask for it
+          (the resource creator notes this at resource.rs:2662).
+  Read:   crates/victory-gpu/src/resource.rs:656, :667, :748
+  Values: (unset) | 1 | any other value  -> twins on   [default]
+          0                              -> none; UAV views of depth are null
+          stencil                        -> only formats with a stencil plane
+          nodepth                        -> no twin for the depth plane of a
+                                            stencil format (its stencil plane
+                                            still gets one)
+  Note:   With 0 or a partial mode, shader writes to those shadow maps are
+          dropped; expect missing or stale shadows if the title uses that
+          path on this machine.
+
+
+3. RAY-TRACED SHADOWS AND INDIRECT LIGHT (the title's own RT)
+-------------------------------------------------------------
+
+The title traces the sun's and lamps' shadows and its bounce light in its own
+compute programs. That needs the dynamic BVH builder to run, which is off by
+default (docs/fork-ray-tracing.md).
+
+VICTORY_BVH_BUILDER
+  What:   Lets the title's BVH builder stages run. Without it every ray
+          misses: no ray-traced shadows, no lamp or sun shadow rays, and
+          interiors go black (VICTORY_AMBIENT is the stand-in).
+  Read:   crates/victory-gpu/src/pipeline.rs:333,
+          crates/victory-gpu/src/pipeline/make.rs:62, :75
+  Values: 1 -> on; anything else or unset -> off   [default off]
+  Cost:   about 40 ms of the card's time a frame in the dorm scene
+          (docs/fork-ray-tracing.md).
+  Set by: scripts/play.ps1:28 (-RayTracing), scripts/launch-game-fast.bat
+          intent is VICTORY_RAYTRACING (see the last section).
+  Safety: all builder pipelines must have host pipelines or none run.
+
+VICTORY_BVH_QUARANTINE
+  What:   Keeps the builder's stores out of title memory (first-test safety).
+  Read:   crates/victory-gpu/src/pipeline.rs:307
+  Values: 1 -> on; else off   [default off]
+
+VICTORY_BVH_BOUNDS / VICTORY_BVH_FENCES
+  What:   Bounds the builder's accesses / fences its buffer atomics; the
+          defaults are the safe forms.
+  Read:   crates/victory-shader/src/emit/mod.rs:201 / :192
+  Values: =0 turns one off; anything else or unset leaves it on  [on]
+
+VICTORY_BVH_SIZES_WAIT
+  What:   Waits for submissions that ask a structure's compacted size.
+  Read:   crates/victory-gpu/src/memory.rs:819
+  Values: =1 on; else off  [off]
+  Note:   Did not fix the overlapping-structures fault and costs about
+          20 ms a frame (docs/fork-ray-tracing.md).
+
+VICTORY_BVH_TRACE
+  What:   Logs the sizes the title asks, when they arrived, and the copies.
+  Read:   crates/victory-gpu/src/memory.rs:1091
+  Values: =1 on; else off  [off]
+
+VICTORY_MEMORY_CARD_MB
+  What:   How much title memory by raw address is kept on the card, in MiB
+          (the BVH arenas and what the builder touches).
+  Read:   crates/victory-gpu/src/shadow.rs:5419
+  Values: integer MiB   [default 4096]
+
+VICTORY_MEMORY_DUMP
+  What:   Folder a "go" file makes the layer write the BVH arenas into.
+  Read:   crates/victory-gpu/src/memory.rs:1197
+  Values: a folder path  [unset, nothing dumped]
+
+VICTORY_RT_RESOLVE
+  What:   Without the builder, about 1,000 CS_RaytracingResolve shaders are
+          left out (they would shade no hits and clog the cold compiler).
+          =1 keeps them anyway.
+  Read:   crates/victory-gpu/src/pipeline/make.rs:68
+  Values: 1 -> kept; 0 or unset -> left out while the builder is off
+
+VICTORY_ACTIVATE_RAYS
+  What:   Same for CS_ScreenProbes_ActivateRays: left out while the builder
+          is off; with the builder, =0 leaves it out.
+  Read:   crates/victory-gpu/src/pipeline/make.rs:77, :79
+  Values: 1 / 0   [unset: left out unless VICTORY_BVH_BUILDER=1]
+
+
+4. SWITCHES THAT REACH SHADOW PASSES BUT ARE NOT SHADOW SETTINGS
+----------------------------------------------------------------
+
+VICTORY_SCISSOR_TEST
+  What:   =full replaces every scissor rectangle with a full-screen one; this
+          also takes the shadow-scaled scissor path out (draw.rs:1254). An
+          experiment, not a quality knob.
+  Read:   crates/victory-gpu/src/draw.rs:526
+
+VICTORY_AMBIENT, VICTORY_AMBIENT_AIR, VICTORY_AMBIENT_SHADE
+  What:   The stand-in for the missing ray-traced light. They change how
+          SHADOWED areas look, not the shadow maps.
+  Read:   crates/victory-gpu/src/ambient.rs:97, :110, :120
+
+
+5. NOT READ BY THE RUNTIME
+--------------------------
+
+VICTORY_RAYTRACING
+  Set by scripts/launch-game-fast.bat:69 and scripts/bench_fps.py:373 but
+  never read: there is no std::env::var("VICTORY_RAYTRACING") anywhere in the
+  tree. It does not turn ray-traced shadows on. Use VICTORY_BVH_BUILDER=1 (or
+  play.ps1 -RayTracing) for that.
