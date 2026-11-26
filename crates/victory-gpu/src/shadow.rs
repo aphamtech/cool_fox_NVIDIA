@@ -218,12 +218,31 @@ fn card_limits() -> (u64, u64) {
     static LIMITS: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
     *LIMITS.get_or_init(|| {
         let env_mb = |name: &str| std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok());
-        let vram_budget = crate::host::host().and_then(|h| h.video_memory()).map(|[budget, ..]| budget);
-        let (mut min_bytes, max_bytes) = resolve_card_limits(
+        let h = crate::host::host();
+        let vram_budget = h.and_then(|h| h.video_memory()).map(|[budget, ..]| budget);
+        let nvidia = h.is_some_and(crate::host::Host::is_nvidia);
+        let min_mb_override = env_mb("VICTORY_CARD_BUFFERS_MIN_MB");
+        let max_mb_override = env_mb("VICTORY_CARD_BUFFERS_MB");
+        let (mut min_bytes, mut max_bytes) = resolve_card_limits(
             vram_budget,
-            env_mb("VICTORY_CARD_BUFFERS_MIN_MB"),
-            env_mb("VICTORY_CARD_BUFFERS_MB"),
+            min_mb_override,
+            max_mb_override,
         );
+        // On discrete NVIDIA GPUs, place mesh/skinning/index/constant title buffers
+        // down to 64 KiB in fastest local VRAM by default, and give 8-12 GB cards
+        // 1024 MiB of card-buffer headroom unless explicitly overridden.
+        if nvidia {
+            if min_mb_override.is_none() {
+                min_bytes = 64 << 10;
+            }
+            if max_mb_override.is_none()
+                && let Some(budget) = vram_budget
+                && budget >= 8 << 30
+                && max_bytes < 1024 << 20
+            {
+                max_bytes = 1024 << 20;
+            }
+        }
         // `VICTORY_CARD_BUFFERS_MIN_KB` (after fxceless c36971b2) says the
         // least size in KiB, so that it can go under 1 MiB: 64 is every title
         // buffer. Copies under 1 MiB are nearly all there are and few bytes;
@@ -238,6 +257,7 @@ fn card_limits() -> (u64, u64) {
             min_bytes = 0;
         }
         tracing::info!(
+            nvidia,
             vram_budget_mb = vram_budget.map(|b| b >> 20),
             card_buffers_min_kb = min_bytes >> 10,
             card_buffers_max_mb = max_bytes >> 20,
@@ -451,10 +471,70 @@ fn card_room_for(size: u64) -> Option<ID3D12Resource> {
 /// card later windows stay where they are. The CPU's side stays in the PC's
 /// memory, so the memory shared with the card does not shrink by this
 /// alone; what moves is what shaders read.
+/// Default MiB budget for loose mesh/vertex/index/constant windows placed
+/// directly in CPU-mapped local VRAM (`D3D12_HEAP_TYPE_GPU_UPLOAD`, Resizable BAR)
+/// when `VICTORY_WINDOWS_BAR_MB` is unset.
+fn default_window_bar_mb(nvidia: bool, rebar: bool, local_vram_budget: Option<u64>) -> u64 {
+    if !nvidia || !rebar {
+        return 0;
+    }
+    let Some(budget_bytes) = local_vram_budget else {
+        return 0;
+    };
+    let budget_mb = budget_bytes >> 20;
+    if budget_mb < 8 * 1024 {
+        0
+    } else if budget_mb <= 12 * 1024 {
+        512
+    } else if budget_mb < 20 * 1024 {
+        1536
+    } else {
+        (budget_mb / 6).min(4096)
+    }
+}
+
+/// Default MiB budget for loose mesh/vertex/index/constant windows mirrored to
+/// dedicated VRAM (`D3D12_HEAP_TYPE_DEFAULT`) when ReBAR is unavailable and
+/// `VICTORY_CARD_WINDOWS_MB` is unset.
+fn default_window_card_mb(nvidia: bool, rebar: bool, local_vram_budget: Option<u64>) -> u64 {
+    if !nvidia || rebar {
+        return 0;
+    }
+    let Some(budget_bytes) = local_vram_budget else {
+        return 0;
+    };
+    let budget_mb = budget_bytes >> 20;
+    if budget_mb < 8 * 1024 {
+        0
+    } else if budget_mb <= 12 * 1024 {
+        512
+    } else if budget_mb < 20 * 1024 {
+        1024
+    } else {
+        2048
+    }
+}
+
 fn window_card_most() -> u64 {
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *MOST.get_or_init(|| {
-        std::env::var("VICTORY_CARD_WINDOWS_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0) << 20
+        let mb = match std::env::var("VICTORY_CARD_WINDOWS_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+        {
+            Some(mb) => mb,
+            None => {
+                let h = host();
+                let nvidia = h.is_some_and(crate::host::Host::is_nvidia);
+                let rebar = h.is_some_and(crate::host::Host::mapped_card_memory);
+                let budget = h.and_then(|h| h.video_memory()).map(|[b, ..]| b);
+                default_window_card_mb(nvidia, rebar, budget)
+            }
+        };
+        if mb > 0 {
+            tracing::info!(window_card_mb = mb, "loose mesh/buffer windows mirrored to local VRAM");
+        }
+        mb << 20
     })
 }
 
@@ -492,7 +572,23 @@ fn window_card_for(size: u64) -> Option<ID3D12Resource> {
 fn window_mapped_most() -> u64 {
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *MOST.get_or_init(|| {
-        std::env::var("VICTORY_WINDOWS_BAR_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0) << 20
+        let mb = match std::env::var("VICTORY_WINDOWS_BAR_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+        {
+            Some(mb) => mb,
+            None => {
+                let h = host();
+                let nvidia = h.is_some_and(crate::host::Host::is_nvidia);
+                let rebar = h.is_some_and(crate::host::Host::mapped_card_memory);
+                let budget = h.and_then(|h| h.video_memory()).map(|[b, ..]| b);
+                default_window_bar_mb(nvidia, rebar, budget)
+            }
+        };
+        if mb > 0 {
+            tracing::info!(window_bar_mb = mb, "loose mesh/buffer windows placed directly in ReBAR VRAM (GPU_UPLOAD)");
+        }
+        mb << 20
     })
 }
 
@@ -507,8 +603,9 @@ fn window_mapped_for(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         return None;
     }
     let host = host()?;
+    let limit_pct = if host.is_nvidia() { 85 } else { 80 };
     if let Some([budget, used, ..]) = host.video_memory()
-        && used + size > budget / 10 * 8
+        && used + size > budget / 100 * limit_pct
     {
         return None;
     }
@@ -5425,9 +5522,28 @@ pub(crate) fn exact_line(frames: f64) {
 #[cfg(test)]
 mod window_tests {
     use super::{
-        WINDOW, cover, default_card_limits_mb, grid, holder, longest_tail, resolve_card_limits,
-        tail_of, window_of,
+        WINDOW, cover, default_card_limits_mb, default_window_bar_mb, default_window_card_mb,
+        grid, holder, longest_tail, resolve_card_limits, tail_of, window_of,
     };
+
+    #[test]
+    fn nvidia_window_vram_defaults_scale_with_rebar_and_budget() {
+        const GIB: u64 = 1 << 30;
+        // Non-NVIDIA leaves defaults at 0.
+        assert_eq!(default_window_bar_mb(false, true, Some(24 * GIB)), 0);
+        assert_eq!(default_window_card_mb(false, false, Some(24 * GIB)), 0);
+        // NVIDIA with ReBAR prefers GPU_UPLOAD BAR windows and 0 duplicated card windows.
+        assert_eq!(default_window_bar_mb(true, true, Some(6 * GIB)), 0);
+        assert_eq!(default_window_bar_mb(true, true, Some(10 * GIB)), 512);
+        assert_eq!(default_window_bar_mb(true, true, Some(15 * GIB)), 1536);
+        assert_eq!(default_window_bar_mb(true, true, Some(24 * GIB)), 4096);
+        assert_eq!(default_window_card_mb(true, true, Some(24 * GIB)), 0);
+        // NVIDIA without ReBAR mirrors loose mesh windows to dedicated VRAM.
+        assert_eq!(default_window_bar_mb(true, false, Some(16 * GIB)), 0);
+        assert_eq!(default_window_card_mb(true, false, Some(10 * GIB)), 512);
+        assert_eq!(default_window_card_mb(true, false, Some(15 * GIB)), 1024);
+        assert_eq!(default_window_card_mb(true, false, Some(24 * GIB)), 2048);
+    }
 
     #[test]
     fn card_limits_scale_with_local_vram_budget() {

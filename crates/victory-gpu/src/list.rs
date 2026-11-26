@@ -937,11 +937,12 @@ extern "system" fn copy_buffer_region(
 /// in size, so the host cannot copy between them (logged once).
 #[cfg(windows)]
 fn unlike(dst: This, src: This) -> bool {
-    let unlike = crate::resource::stands_in(dst) != crate::resource::stands_in(src);
+    let unlike = crate::resource::stands_in(dst) != crate::resource::stands_in(src)
+        || crate::resource::shadow_scale(dst) != crate::resource::shadow_scale(src);
     if unlike {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| {
-            tracing::warn!(?dst, ?src, "copy between a stand-in target and title-format texels skipped")
+            tracing::warn!(?dst, ?src, "copy between incompatible target formats or shadow scales skipped")
         });
     }
     unlike
@@ -1199,7 +1200,29 @@ extern "system" fn copy_texture_region(
         ensure_state(list, dst.resource, COPY_DEST);
         let mut to_location = dst;
         to_location.resource = to.as_raw().cast_const().cast();
-        let host_box = (!source_box.is_null()).then(|| source_box.cast::<D3D12_BOX>());
+        let shadow_s = if src.kind != FOOTPRINT && dst.kind != FOOTPRINT {
+            crate::resource::shadow_scale(dst.resource)
+        } else {
+            1
+        };
+        let (x, y) = (x.saturating_mul(shadow_s), y.saturating_mul(shadow_s));
+        let scaled_box = (!source_box.is_null()).then(|| {
+            // SAFETY: caller passed a valid 6-u32 D3D12_BOX.
+            let b = unsafe { *source_box.cast::<D3D12_BOX>() };
+            if shadow_s > 1 {
+                D3D12_BOX {
+                    left: b.left.saturating_mul(shadow_s),
+                    top: b.top.saturating_mul(shadow_s),
+                    front: b.front,
+                    right: b.right.saturating_mul(shadow_s),
+                    bottom: b.bottom.saturating_mul(shadow_s),
+                    back: b.back,
+                }
+            } else {
+                b
+            }
+        });
+        let host_box = scaled_box.as_ref().map(std::ptr::from_ref);
         #[cfg(feature = "diagnostics")]
         {
             let text = || {
@@ -1422,10 +1445,31 @@ extern "system" fn clear_rtv(
         let Some(color) = (unsafe { color.as_ref() }) else {
             return;
         };
-        let rects = (count > 0 && !rects.is_null()).then(|| {
-            // SAFETY: the title passes `count` rectangles, laid out as the host's.
-            unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }
-        });
+        let scale = crate::resource::shadow_scale(record.resource) as i32;
+        let scaled_rects: Option<Vec<windows::Win32::Foundation::RECT>> =
+            (count > 0 && !rects.is_null()).then(|| {
+                // SAFETY: the title passes `count` rectangles, laid out as the host's.
+                let slice = unsafe {
+                    std::slice::from_raw_parts(
+                        rects.cast::<windows::Win32::Foundation::RECT>(),
+                        count as usize,
+                    )
+                };
+                if scale > 1 {
+                    slice
+                        .iter()
+                        .map(|r| windows::Win32::Foundation::RECT {
+                            left: r.left.saturating_mul(scale),
+                            top: r.top.saturating_mul(scale),
+                            right: r.right.saturating_mul(scale),
+                            bottom: r.bottom.saturating_mul(scale),
+                        })
+                        .collect()
+                } else {
+                    slice.to_vec()
+                }
+            });
+        let rects = scaled_rects.as_deref();
         const RENDER_TARGET: u32 = 0x4;
         let rtv = host.rtv(Some(texture), record.desc().as_ref());
         if crate::graphics::uma_bridge_enabled() {
@@ -1476,10 +1520,31 @@ extern "system" fn clear_dsv(
         ) else {
             return;
         };
-        let rects = (count > 0 && !rects.is_null()).then(|| {
-            // SAFETY: the title passes `count` rectangles, laid out as the host's.
-            unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }
-        });
+        let scale = crate::resource::shadow_scale(record.resource) as i32;
+        let scaled_rects: Option<Vec<windows::Win32::Foundation::RECT>> =
+            (count > 0 && !rects.is_null()).then(|| {
+                // SAFETY: the title passes `count` rectangles, laid out as the host's.
+                let slice = unsafe {
+                    std::slice::from_raw_parts(
+                        rects.cast::<windows::Win32::Foundation::RECT>(),
+                        count as usize,
+                    )
+                };
+                if scale > 1 {
+                    slice
+                        .iter()
+                        .map(|r| windows::Win32::Foundation::RECT {
+                            left: r.left.saturating_mul(scale),
+                            top: r.top.saturating_mul(scale),
+                            right: r.right.saturating_mul(scale),
+                            bottom: r.bottom.saturating_mul(scale),
+                        })
+                        .collect()
+                } else {
+                    slice.to_vec()
+                }
+            });
+        let rects = scaled_rects.as_deref();
         const DEPTH_WRITE: u32 = 0x10;
         // A depth texture shaders also write: what they wrote, first (the
         // clear may be of one slice or of some rectangles).

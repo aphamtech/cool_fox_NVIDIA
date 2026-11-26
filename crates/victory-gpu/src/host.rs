@@ -63,6 +63,10 @@ pub(crate) struct Host {
     /// The adapter the device is on, for its memory budget
     /// ([`Host::video_memory`]); `None` if the system does not name it.
     adapter: Option<IDXGIAdapter3>,
+    /// True when the selected host GPU is an NVIDIA adapter (`VendorId == 0x10DE`).
+    nvidia: bool,
+    /// Dedicated local VRAM reported by DXGI (`DXGI_ADAPTER_DESC1::DedicatedVideoMemory`).
+    dedicated_vram: u64,
     /// 1-descriptor shader-visible fallback heaps bound when a command list
     /// omits a view or sampler heap while using directly-indexed root signatures.
     fallback_view: OnceLock<Option<ID3D12DescriptorHeap>>,
@@ -934,7 +938,13 @@ fn create() -> windows::core::Result<Host> {
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
         } else {
-            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            if let Some(preferred) = preferred_adapter() {
+                if D3D12CreateDevice(&preferred, D3D_FEATURE_LEVEL_12_0, &mut device).is_err() {
+                    D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+                }
+            } else {
+                D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            }
             // Whether a GPU hang ends the run or freezes the PC (#1054).
             crate::tdr::log();
         }
@@ -977,10 +987,40 @@ fn create() -> windows::core::Result<Host> {
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
-        let queue: ID3D12CommandQueue = device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
-            Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
-            ..Default::default()
-        })?;
+        let adapter = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+            .and_then(|factory| factory.EnumAdapterByLuid::<IDXGIAdapter3>(device.GetAdapterLuid()))
+            .ok();
+        let (nvidia, dedicated_vram, adapter_name, vendor_id) = adapter
+            .as_ref()
+            .and_then(|a| a.GetDesc1().ok())
+            .map(|d| {
+                let len = d.Description.iter().position(|&c| c == 0).unwrap_or(d.Description.len());
+                let name = String::from_utf16_lossy(&d.Description[..len]);
+                (
+                    d.VendorId == 0x10DE && (d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32) == 0,
+                    d.DedicatedVideoMemory as u64,
+                    name,
+                    d.VendorId,
+                )
+            })
+            .unwrap_or_else(|| (false, 0, String::from("unknown"), 0));
+        let queue_priority = if nvidia {
+            D3D12_COMMAND_QUEUE_PRIORITY_HIGH.0
+        } else {
+            D3D12_COMMAND_QUEUE_PRIORITY_NORMAL.0
+        };
+        let queue: ID3D12CommandQueue = device
+            .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                Priority: queue_priority,
+                ..Default::default()
+            })
+            .or_else(|_| {
+                device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                    Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    ..Default::default()
+                })
+            })?;
         let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
         let event = CreateEventW(None, false, false, None)?;
         let rtvs: ID3D12DescriptorHeap =
@@ -997,11 +1037,7 @@ fn create() -> windows::core::Result<Host> {
                 ..Default::default()
             })?;
         let dsv_size = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
-        let adapter = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
-            .and_then(|factory| factory.EnumAdapterByLuid::<IDXGIAdapter3>(device.GetAdapterLuid()))
-            .ok();
-        tracing::info!("host D3D12 device ready");
-        Ok(Host {
+        let host = Host {
             device,
             queue,
             fence,
@@ -1016,15 +1052,38 @@ fn create() -> windows::core::Result<Host> {
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(None),
             adapter,
+            nvidia,
+            dedicated_vram,
             fallback_view: OnceLock::new(),
             fallback_sampler: OnceLock::new(),
             rebar: OnceLock::new(),
             compute: OnceLock::new(),
-        })
+        };
+        let rebar = host.mapped_card_memory();
+        tracing::info!(
+            adapter = %adapter_name,
+            vendor = format_args!("{vendor_id:#06x}"),
+            nvidia,
+            dedicated_vram_mb = dedicated_vram >> 20,
+            rebar_gpu_upload = rebar,
+            "host D3D12 device ready"
+        );
+        Ok(host)
     }
 }
 
 impl Host {
+    /// True when the host D3D12 device is running on a hardware NVIDIA GPU.
+    pub(crate) fn is_nvidia(&self) -> bool {
+        self.nvidia
+    }
+
+    /// Dedicated local VRAM reported by DXGI in bytes (0 if unknown).
+    #[allow(dead_code)]
+    pub(crate) fn dedicated_vram(&self) -> u64 {
+        self.dedicated_vram
+    }
+
     /// The driver's version, as the system counts it (0: not known).
     pub(crate) fn driver(&self) -> i64 {
         let adapter = self.adapter.as_ref();
@@ -1105,6 +1164,45 @@ impl Host {
                 }
             })
             .as_ref()
+    }
+}
+
+/// Whether the initialized host D3D12 device is a hardware NVIDIA GPU.
+pub(crate) fn is_nvidia() -> bool {
+    host().is_some_and(Host::is_nvidia)
+}
+
+/// Pick the highest-performance hardware adapter (preferring a discrete NVIDIA
+/// GPU when present, otherwise the highest-VRAM high-performance hardware GPU).
+fn preferred_adapter() -> Option<IDXGIAdapter1> {
+    // SAFETY: standard DXGI factory enumeration.
+    unsafe {
+        let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+        let mut best_nvidia: Option<(u64, IDXGIAdapter1)> = None;
+        let mut best_other: Option<(u64, IDXGIAdapter1)> = None;
+        for index in 0..16u32 {
+            let Ok(adapter) = factory.EnumAdapterByGpuPreference::<IDXGIAdapter1>(
+                index,
+                DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
+            ) else {
+                break;
+            };
+            let Ok(desc) = adapter.GetDesc1() else {
+                continue;
+            };
+            if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32) != 0 {
+                continue;
+            }
+            let vram = desc.DedicatedVideoMemory as u64;
+            if desc.VendorId == 0x10DE {
+                if best_nvidia.as_ref().is_none_or(|(best, _)| vram > *best) {
+                    best_nvidia = Some((vram, adapter));
+                }
+            } else if best_other.as_ref().is_none_or(|(best, _)| vram > *best) {
+                best_other = Some((vram, adapter));
+            }
+        }
+        best_nvidia.or(best_other).map(|(_, adapter)| adapter)
     }
 }
 
@@ -3811,6 +3909,7 @@ pub(crate) mod aside;
 pub(crate) mod awake;
 mod card_steps;
 pub(crate) mod indirects;
+mod menu;
 #[cfg(feature = "diagnostics")]
 mod panel;
 mod place;
@@ -8890,7 +8989,13 @@ fn swap_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
     })
 }
 
-const BUFFERS: u32 = 2;
+/// Keep 4 flip buffers so FrameGen can be toggled ON/OFF live via F10
+/// without stalling the swap-chain flip queue.
+const BUFFERS: u32 = 4;
+
+fn swap_buffers() -> u32 {
+    BUFFERS
+}
 
 struct Presenter {
     swap_chain: IDXGISwapChain3,
@@ -8905,6 +9010,10 @@ struct Presenter {
     hwnd: HWND,
     meter: Meter,
     composer: Option<crate::compose::Composer>,
+    dlss: Option<crate::dlss::Dlss>,
+    dlss_tried: bool,
+    framegen: Option<crate::framegen::FrameGen>,
+    menu: menu::Menu,
     #[cfg(feature = "diagnostics")]
     panel: panel::Panel,
 }
@@ -9169,6 +9278,41 @@ impl Meter {
             );
             #[cfg(feature = "diagnostics")]
             {
+                let st = crate::fsr::status();
+                let fsr_state = if st.fsr_active {
+                    "ENABLED (ACTIVE)"
+                } else if st.fsr_dll_loaded {
+                    "ENABLED (LOADED)"
+                } else if st.fsr_dll_present {
+                    "READY (DLL FOUND)"
+                } else {
+                    "DISABLED (NO DLL)"
+                };
+                let fg_state = if st.framegen_active {
+                    "ENABLED (ACTIVE)"
+                } else if st.framegen_enabled {
+                    "ENABLED (READY)"
+                } else {
+                    "DISABLED"
+                };
+                let disp_fps = if st.framegen_active { fps * 2.0 } else { fps };
+                tracing::info!(
+                    "diag upscaling/shadows: FSR={fsr_state} (dispatches={}, render={}x{}->{}x{}, mvs={}) | \
+                     FrameGen={fg_state} (mode={}, generated={}, display_fps={disp_fps:.1}, game_fps={fps:.1}) | \
+                     Shadows={}x ({}x{}, scaled_maps={})",
+                    st.fsr_dispatches,
+                    st.fsr_render_size.0,
+                    st.fsr_render_size.1,
+                    st.fsr_upscale_size.0,
+                    st.fsr_upscale_size.1,
+                    st.fsr_has_motion_vectors,
+                    st.framegen_mode,
+                    st.framegen_generated,
+                    st.shadow_scale * st.shadow_scale,
+                    st.shadow_scale,
+                    st.shadow_scale,
+                    st.shadow_maps_scaled,
+                );
                 let put = [0, 1, 2, 3].map(|i| crate::shadow::PUT[i].swap(0, Ordering::Relaxed) as f64 / frames);
                 tracing::info!(
                     "what shaders wrote put into title memory per frame (VICTORY_EXACT_BACK): {:.0} pieces in {:.0} writes, {:.1} MB; {:.0} pieces joined over gaps",
@@ -9196,6 +9340,34 @@ impl Meter {
             self.caption = Some(buffer);
         }
         let Some(caption) = &self.caption else { return };
+        #[cfg(feature = "diagnostics")]
+        let text = {
+            let st = crate::fsr::status();
+            let fsr_label = if st.fsr_active {
+                "ON"
+            } else if st.fsr_dll_loaded {
+                "LOADED"
+            } else if st.fsr_dll_present {
+                "DLL"
+            } else {
+                "OFF"
+            };
+            let fg_label = if st.framegen_active {
+                format!("ON({})", st.framegen_mode)
+            } else if st.framegen_enabled {
+                "READY".to_owned()
+            } else {
+                "OFF".to_owned()
+            };
+            let shown_fps = if st.framegen_active { fps * 2.0 } else { fps };
+            format!(
+                " | VIctory {shown_fps:.0} fps ({fps:.0} game) {ms:.1} ms | {}({}) FSR:{fsr_label} FG:{fg_label} SHD:{}x [F10]",
+                st.upscaler.label(),
+                st.render_quality.short_label(),
+                st.shadow_scale * st.shadow_scale
+            )
+        };
+        #[cfg(not(feature = "diagnostics"))]
         let text = format!(" | VIctory {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame");
         let mut text: Vec<u16> = caption.iter().copied().chain(text.encode_utf16()).collect();
         text.push(0);
@@ -9263,10 +9435,18 @@ impl Host {
             };
             format
         };
-        let (width, height) = (desc.Width as u32, desc.Height);
+        let (in_width, in_height) = (desc.Width as u32, desc.Height);
         let mut presenter = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
         if presenter.is_none() {
-            *presenter = match self.presenter(width, height, format) {
+            let (init_w, init_h) = if self.is_nvidia()
+                && crate::fsr::upscaler_choice() == crate::fsr::UpscalerChoice::Dlss
+            {
+                crate::dlss::DlssMode::from_render_quality(crate::fsr::render_quality())
+                    .output_dimensions(in_width, in_height)
+            } else {
+                (in_width, in_height)
+            };
+            *presenter = match self.presenter(init_w, init_h, format) {
                 Ok(p) => Some(p),
                 Err(e) => {
                     tracing::warn!(error = %e, "no swap chain");
@@ -9276,6 +9456,27 @@ impl Host {
         }
         let state_u32 = state;
         let p = presenter.as_mut()?;
+        // Poll the in-game F10 menu before deciding upscaler / FrameGen for this frame.
+        p.menu.poll();
+        let want_dlss = crate::fsr::upscaler_choice() == crate::fsr::UpscalerChoice::Dlss;
+        if want_dlss && p.dlss.is_none() && !p.dlss_tried {
+            p.dlss_tried = true;
+            p.dlss = crate::dlss::Dlss::try_new_live(self);
+        }
+        let (width, height) = if want_dlss {
+            p.dlss
+                .as_ref()
+                .map_or((in_width, in_height), |d| d.output_dimensions(in_width, in_height))
+        } else {
+            crate::fsr::set_dlss_active(false);
+            (in_width, in_height)
+        };
+        let want_fg = crate::fsr::framegen_enabled_live();
+        if want_fg && p.framegen.is_none() {
+            p.framegen = crate::framegen::FrameGen::try_new_live(self);
+        } else if !want_fg && let Some(fg) = p.framegen.as_mut() {
+            fg.reset_history();
+        }
         if planes.is_some() && p.composer.is_none() {
             match crate::compose::Composer::new(self, format) {
                 Ok(c) => p.composer = Some(c),
@@ -9292,7 +9493,7 @@ impl Host {
             // SAFETY: no back buffer is held; every submission was waited for.
             let resized = unsafe {
                 p.swap_chain
-                    .ResizeBuffers(BUFFERS, width, height, format, DXGI_SWAP_CHAIN_FLAG(0))
+                    .ResizeBuffers(swap_buffers(), width, height, format, DXGI_SWAP_CHAIN_FLAG(0))
             };
             match resized {
                 Ok(()) => {
@@ -9328,10 +9529,6 @@ impl Host {
         let state = D3D12_RESOURCE_STATES(state_u32 as i32);
         // SAFETY: our swap chain, list and live source texture(s).
         unsafe {
-            let index = p.swap_chain.GetCurrentBackBufferIndex();
-            let Ok(back) = p.swap_chain.GetBuffer::<ID3D12Resource>(index) else {
-                return None;
-            };
             // Sent ahead ([`late_free_present`]) unless the frame is to be
             // read back at once (a saved or listed frame): then a list of
             // its own, one whose last flight has finished or a new one.
@@ -9339,6 +9536,171 @@ impl Host {
             let read_now = crate::capture::wanted(frame) || crate::capture::listed(frame);
             #[cfg(not(feature = "diagnostics"))]
             let read_now = false;
+
+            // Optional FSR / Optical-Flow Frame Generation: synthesize and
+            // present an intermediate 3D scene frame (t = 0.5) before the real
+            // frame, compositing the crisp UI overlay on top without warping.
+            if want_fg
+                && !read_now
+                && let Some(scene_srv_fmt) = crate::compose::view(&desc)
+                && p.framegen.is_some()
+            {
+                let fg_slot = if late_free_present() {
+                    let finished = FINISHED.load(Ordering::Acquire);
+                    p.ahead.iter().position(|(_, flown)| *flown <= finished).or_else(|| {
+                        let list = self.new_list().ok()?;
+                        list.close();
+                        p.ahead.push((list, 0));
+                        Some(p.ahead.len() - 1)
+                    })
+                } else {
+                    None
+                };
+                let fg_heap_slot = fg_slot.map_or(0, |i| i + 1);
+                let fg_copy = match fg_slot {
+                    Some(i) => &p.ahead[i].0,
+                    None => &p.copy,
+                };
+                fg_copy.reset();
+                fg_copy.keep(texture);
+                let generated = p.framegen.as_mut().and_then(|fg| {
+                    fg.generate(
+                        self,
+                        fg_heap_slot,
+                        &fg_copy.list,
+                        texture,
+                        state,
+                        in_width,
+                        in_height,
+                        desc.Format,
+                        scene_srv_fmt,
+                        frame,
+                    )
+                });
+                let mut present_fg = false;
+                if let Some((interp_tex, interp_fmt)) = generated {
+                    fg_copy.keep(&interp_tex);
+                    let fg_index = p.swap_chain.GetCurrentBackBufferIndex();
+                    if let Ok(back_fg) = p.swap_chain.GetBuffer::<ID3D12Resource>(fg_index) {
+                        let fg_list = &fg_copy.list;
+                        if let Some((over, over_state, _, over_fmt)) = planes
+                            && let Some(composer) = p.composer.as_mut()
+                        {
+                            fg_copy.keep(over);
+                            let mut pre = Vec::with_capacity(3);
+                            pre.push(transition(
+                                &interp_tex,
+                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                            ));
+                            if over_state != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE {
+                                pre.push(transition(
+                                    over,
+                                    over_state,
+                                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                                ));
+                            }
+                            pre.push(transition(
+                                &back_fg,
+                                D3D12_RESOURCE_STATE_PRESENT,
+                                D3D12_RESOURCE_STATE_RENDER_TARGET,
+                            ));
+                            fg_list.ResourceBarrier(&pre);
+                            if composer
+                                .record(
+                                    self,
+                                    fg_heap_slot,
+                                    fg_list,
+                                    [(&interp_tex, interp_fmt), (over, over_fmt)],
+                                    &back_fg,
+                                    (width, height),
+                                )
+                                .is_ok()
+                            {
+                                let mut post = Vec::with_capacity(3);
+                                post.push(transition(
+                                    &interp_tex,
+                                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                ));
+                                if over_state != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE {
+                                    post.push(transition(
+                                        over,
+                                        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                                        over_state,
+                                    ));
+                                }
+                                post.push(transition(
+                                    &back_fg,
+                                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                    D3D12_RESOURCE_STATE_COPY_DEST,
+                                ));
+                                fg_list.ResourceBarrier(&post);
+                                #[cfg(feature = "diagnostics")]
+                                p.panel.draw(self, fg_copy, &back_fg, (width, height), format);
+                                p.menu.draw(self, fg_copy, &back_fg, (width, height), format);
+                                fg_list.ResourceBarrier(&[transition(
+                                    &back_fg,
+                                    D3D12_RESOURCE_STATE_COPY_DEST,
+                                    D3D12_RESOURCE_STATE_PRESENT,
+                                )]);
+                                present_fg = true;
+                            }
+                        } else if (in_width, in_height) == (width, height) && interp_fmt == format {
+                            fg_list.ResourceBarrier(&[
+                                transition(
+                                    &interp_tex,
+                                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                ),
+                                transition(
+                                    &back_fg,
+                                    D3D12_RESOURCE_STATE_PRESENT,
+                                    D3D12_RESOURCE_STATE_COPY_DEST,
+                                ),
+                            ]);
+                            fg_list.CopyResource(&back_fg, &interp_tex);
+                            #[cfg(feature = "diagnostics")]
+                            p.panel.draw(self, fg_copy, &back_fg, (width, height), format);
+                            p.menu.draw(self, fg_copy, &back_fg, (width, height), format);
+                            fg_list.ResourceBarrier(&[
+                                transition(
+                                    &interp_tex,
+                                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                ),
+                                transition(
+                                    &back_fg,
+                                    D3D12_RESOURCE_STATE_COPY_DEST,
+                                    D3D12_RESOURCE_STATE_PRESENT,
+                                ),
+                            ]);
+                            present_fg = true;
+                        }
+                    }
+                }
+                fg_copy.close();
+                match fg_slot {
+                    Some(i) => {
+                        let flown = self.execute_own(fg_copy);
+                        p.ahead[i].1 = flown;
+                    }
+                    None => {
+                        self.execute(&[fg_copy]);
+                    }
+                }
+                if present_fg {
+                    let _ = p
+                        .swap_chain
+                        .Present(crate::framegen::sync_interval(), DXGI_PRESENT(0));
+                    crate::framegen::note_generated_present();
+                }
+            }
+
+            let index = p.swap_chain.GetCurrentBackBufferIndex();
+            let Ok(back) = p.swap_chain.GetBuffer::<ID3D12Resource>(index) else {
+                return None;
+            };
             let slot = if late_free_present() && !read_now {
                 let finished = FINISHED.load(Ordering::Acquire);
                 p.ahead.iter().position(|(_, flown)| *flown <= finished).or_else(|| {
@@ -9357,11 +9719,34 @@ impl Host {
             copy.reset();
             copy.keep(texture);
             let list = &copy.list;
+            // Optional NVIDIA DLSS pass (active only when Upscaler = DLSS in F10 menu).
+            let dlss_fmt = crate::compose::view(&desc).unwrap_or(format);
+            let dlss_out = if want_dlss
+                && let Some(dlss) = p.dlss.as_mut()
+            {
+                let out = dlss
+                    .evaluate(self, list, texture, state, in_width, in_height, dlss_fmt)
+                    .cloned();
+                crate::fsr::set_dlss_active(out.is_some());
+                out
+            } else {
+                crate::fsr::set_dlss_active(false);
+                None
+            };
+            if let Some(ref up) = dlss_out {
+                copy.keep(up);
+            }
             let composed = if let Some((over, over_state, base_fmt, over_fmt)) = planes {
                 copy.keep(over);
                 if let Some(composer) = p.composer.as_mut() {
                     let mut pre = Vec::with_capacity(3);
-                    if state != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE {
+                    if let Some(ref up) = dlss_out {
+                        pre.push(transition(
+                            up,
+                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                        ));
+                    } else if state != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE {
                         pre.push(transition(texture, state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE));
                     }
                     if over_state != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE {
@@ -9370,11 +9755,12 @@ impl Host {
                     pre.push(transition(&back, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET));
                     list.ResourceBarrier(&pre);
                     let compose_slot = slot.map_or(0, |i| i + 1);
+                    let scene_tex = dlss_out.as_ref().unwrap_or(texture);
                     if let Err(err) = composer.record(
                         self,
                         compose_slot,
                         list,
-                        [(texture, base_fmt), (over, over_fmt)],
+                        [(scene_tex, base_fmt), (over, over_fmt)],
                         &back,
                         (width, height),
                     ) {
@@ -9392,11 +9778,18 @@ impl Host {
                             height,
                             base_format = base_fmt.0,
                             overlay_format = over_fmt.0,
+                            dlss = dlss_out.is_some(),
                             "display output: compositing two planes (overlay active)"
                         );
                     }
                     let mut post = Vec::with_capacity(3);
-                    if state != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE {
+                    if let Some(ref up) = dlss_out {
+                        post.push(transition(
+                            up,
+                            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        ));
+                    } else if state != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE {
                         post.push(transition(texture, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, state));
                     }
                     if over_state != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE {
@@ -9416,17 +9809,33 @@ impl Host {
                 false
             };
             if !composed {
-                let mut pre = Vec::with_capacity(2);
-                if state != D3D12_RESOURCE_STATE_COPY_SOURCE {
-                    pre.push(transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE));
+                if let Some(ref up) = dlss_out {
+                    list.ResourceBarrier(&[
+                        transition(
+                            up,
+                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                            D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        ),
+                        transition(
+                            &back,
+                            D3D12_RESOURCE_STATE_PRESENT,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                        ),
+                    ]);
+                    list.CopyResource(&back, up);
+                } else {
+                    let mut pre = Vec::with_capacity(2);
+                    if state != D3D12_RESOURCE_STATE_COPY_SOURCE {
+                        pre.push(transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE));
+                    }
+                    pre.push(transition(
+                        &back,
+                        D3D12_RESOURCE_STATE_PRESENT,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                    ));
+                    list.ResourceBarrier(&pre);
+                    list.CopyResource(&back, texture);
                 }
-                pre.push(transition(
-                    &back,
-                    D3D12_RESOURCE_STATE_PRESENT,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                ));
-                list.ResourceBarrier(&pre);
-                list.CopyResource(&back, texture);
             }
             #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
@@ -9463,6 +9872,7 @@ impl Host {
             };
             #[cfg(feature = "diagnostics")]
             p.panel.draw(self, copy, &back, (width, height), format);
+            p.menu.draw(self, copy, &back, (width, height), format);
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
             if composed {
@@ -9471,6 +9881,19 @@ impl Host {
                     D3D12_RESOURCE_STATE_COPY_DEST,
                     D3D12_RESOURCE_STATE_PRESENT,
                 )]);
+            } else if let Some(ref up) = dlss_out {
+                list.ResourceBarrier(&[
+                    transition(
+                        up,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    ),
+                    transition(
+                        &back,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        D3D12_RESOURCE_STATE_PRESENT,
+                    ),
+                ]);
             } else {
                 let mut post = Vec::with_capacity(2);
                 if state != D3D12_RESOURCE_STATE_COPY_SOURCE {
@@ -9544,7 +9967,7 @@ impl Host {
                     Quality: 0,
                 },
                 BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
-                BufferCount: BUFFERS,
+                BufferCount: swap_buffers(),
                 SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
                 ..Default::default()
             };
@@ -9555,6 +9978,14 @@ impl Host {
             copy.close();
             tracing::info!(width, height, format = format.0, "presenting to a window");
             self.log_video_memory("right after the swap chain is made");
+            let dlss_wanted_at_start =
+                crate::fsr::upscaler_choice() == crate::fsr::UpscalerChoice::Dlss;
+            let dlss = if dlss_wanted_at_start {
+                crate::dlss::Dlss::try_new(self)
+            } else {
+                None
+            };
+            let framegen = crate::framegen::FrameGen::try_new(self);
             Ok(Presenter {
                 swap_chain,
                 width,
@@ -9565,6 +9996,10 @@ impl Host {
                 hwnd,
                 meter: Meter::new(),
                 composer: None,
+                dlss,
+                dlss_tried: dlss_wanted_at_start,
+                framegen,
+                menu: menu::Menu::new(),
                 #[cfg(feature = "diagnostics")]
                 panel: panel::Panel::new(),
             })

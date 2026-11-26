@@ -417,6 +417,8 @@ pub(crate) struct State {
     depth: usize,
     /// The host state the bound depth view needs ([`depth_state`]).
     depth_state: u32,
+    /// Active per-axis resolution multiplier for scaled depth-only shadow maps (`1` or `2`).
+    depth_scale: u32,
     /// The title's primitive topology (the host's may differ).
     topology: u32,
     /// What the title set that goes straight onto the host list, kept for
@@ -1184,11 +1186,22 @@ impl State {
             crate::capture::note_target(record.resource);
             Some((texture, record))
         });
+        let new_depth_scale = if self.targets.is_empty() && self.depth != 0 {
+            crate::resource::shadow_scale(self.depth as This)
+        } else {
+            1
+        };
+        let scale_changed = new_depth_scale != self.depth_scale.max(1);
+        self.depth_scale = new_depth_scale;
         let now = (keys, dsv.as_ref().map(|(texture, record)| (texture.as_raw() as usize, record.key())));
         static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *CACHE.get_or_init(|| std::env::var("VICTORY_BIND_CACHE").map_or(true, |v| v != "0"))
             && self.host_targets.as_ref() == Some(&now)
         {
+            if scale_changed {
+                self.apply_viewports(list);
+                self.apply_scissors(list);
+            }
             return;
         }
         self.host_targets = Some(now);
@@ -1203,6 +1216,67 @@ impl State {
                 dsv.as_ref().map(std::ptr::from_ref),
             )
         };
+        if scale_changed {
+            self.apply_viewports(list);
+            self.apply_scissors(list);
+        }
+    }
+
+    fn apply_viewports(&self, list: &HostList) {
+        if self.viewports.is_empty() {
+            return;
+        }
+        let s = self.depth_scale.max(1);
+        if s == 1 {
+            crate::draw::viewports(list, &self.viewports);
+        } else {
+            let sf = s as f32;
+            let scaled: Vec<D3D12_VIEWPORT> = self
+                .viewports
+                .iter()
+                .map(|v| D3D12_VIEWPORT {
+                    TopLeftX: v.TopLeftX * sf,
+                    TopLeftY: v.TopLeftY * sf,
+                    Width: v.Width * sf,
+                    Height: v.Height * sf,
+                    MinDepth: v.MinDepth,
+                    MaxDepth: v.MaxDepth,
+                })
+                .collect();
+            crate::draw::viewports(list, &scaled);
+        }
+    }
+
+    fn apply_scissors(&self, list: &HostList) {
+        if self.scissors.is_empty() {
+            return;
+        }
+        if scissor_test() {
+            let full = RECT {
+                left: 0,
+                top: 0,
+                right: 16384,
+                bottom: 16384,
+            };
+            crate::draw::scissors(list, &vec![full; self.scissors.len()]);
+            return;
+        }
+        let s = self.depth_scale.max(1) as i32;
+        if s == 1 {
+            crate::draw::scissors(list, &self.scissors);
+        } else {
+            let scaled: Vec<RECT> = self
+                .scissors
+                .iter()
+                .map(|r| RECT {
+                    left: r.left.saturating_mul(s),
+                    top: r.top.saturating_mul(s),
+                    right: r.right.saturating_mul(s),
+                    bottom: r.bottom.saturating_mul(s),
+                })
+                .collect();
+            crate::draw::scissors(list, &scaled);
+        }
     }
 
     /// Viewports, scissors, the blend factor and the stencil reference: set
@@ -1214,26 +1288,13 @@ impl State {
         }
         self.viewports.clear();
         self.viewports.extend_from_slice(viewports);
-        crate::draw::viewports(list, viewports);
+        self.apply_viewports(list);
     }
 
     pub(crate) fn set_scissors(&mut self, list: &HostList, rects: &[RECT]) {
         self.scissors.clear();
         self.scissors.extend_from_slice(rects);
-        if scissor_test() {
-            // The experiment: every rectangle the title sets is widened to
-            // the largest target there is, so nothing is cut by one. What
-            // the listing shows (`op_text`) stays the title's own.
-            let full = RECT {
-                left: 0,
-                top: 0,
-                right: 16384,
-                bottom: 16384,
-            };
-            crate::draw::scissors(list, &vec![full; rects.len()]);
-            return;
-        }
-        crate::draw::scissors(list, rects);
+        self.apply_scissors(list);
     }
 
     pub(crate) fn set_blend_factor(&mut self, list: &HostList, factor: Option<&[f32; 4]>) {
@@ -1277,11 +1338,10 @@ impl State {
             self.set_targets(list, &handles, self.depth_handle);
         }
         if !self.viewports.is_empty() {
-            crate::draw::viewports(list, &self.viewports);
+            self.apply_viewports(list);
         }
         if !self.scissors.is_empty() {
-            let rects = std::mem::take(&mut self.scissors);
-            self.set_scissors(list, &rects);
+            self.apply_scissors(list);
         }
         if let Some(factor) = self.blend {
             crate::draw::blend_factor(list, Some(&factor));

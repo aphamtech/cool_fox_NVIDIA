@@ -158,7 +158,11 @@ pub extern "system" fn GetProcAddress(module: *mut c_void, name: *const u8) -> *
         module
     };
     let Some(m) = registry().iter().find(|m| handle(m) == module) else {
-        return host_override(module, name).unwrap_or_else(|| host::get_proc_address(module, name));
+        if let Some(addr) = host_override(module, name) {
+            return addr;
+        }
+        let resolved = host::get_proc_address(module, name);
+        return fsr_intercept(module, name, resolved);
     };
     // Values below 0x10000 are ordinals; we export by name only.
     if (name as usize) < 0x1_0000 {
@@ -177,6 +181,114 @@ pub extern "system" fn GetProcAddress(module: *mut c_void, name: *const u8) -> *
             tracing::warn!(module = m.name, %name, "GetProcAddress: not implemented");
             std::ptr::null_mut()
         }
+    }
+}
+
+/// Wraps FidelityFX API exports resolved from `amd_fidelityfx_upscaler_xbox.dll`
+/// so VIctory can track active FSR status and capture real motion vectors/depth
+/// for GPU Frame Generation while forwarding every call straight to the DLL.
+fn fsr_intercept(module: *mut c_void, name: *const u8, resolved: *mut c_void) -> *mut c_void {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    if resolved.is_null() || (name as usize) < 0x1_0000 {
+        return resolved;
+    }
+    let Some(path) = runtime::image_path(module as usize) else {
+        return resolved;
+    };
+    let is_fsr_dll = path.file_name().is_some_and(|n| {
+        let lower = n.to_string_lossy().to_ascii_lowercase();
+        lower.contains("fidelityfx") && lower.contains("upscaler")
+    });
+    if !is_fsr_dll {
+        return resolved;
+    }
+    victory_gpu::fsr::note_dll_loaded(Some(&path));
+
+    static REAL_CREATE: AtomicUsize = AtomicUsize::new(0);
+    static REAL_DESTROY: AtomicUsize = AtomicUsize::new(0);
+    static REAL_DISPATCH: AtomicUsize = AtomicUsize::new(0);
+    static REAL_QUERY: AtomicUsize = AtomicUsize::new(0);
+
+    type FfxCreateFn = unsafe extern "C" fn(*mut *mut c_void, *const c_void, *const c_void) -> u32;
+    type FfxDestroyFn = unsafe extern "C" fn(*mut *mut c_void, *const c_void) -> u32;
+    type FfxDispatchFn = unsafe extern "C" fn(*mut *mut c_void, *const c_void) -> u32;
+    type FfxQueryFn = unsafe extern "C" fn(*mut *mut c_void, *mut c_void) -> u32;
+
+    extern "C" fn hook_ffx_create(
+        ctx: *mut *mut c_void,
+        desc: *const c_void,
+        alloc: *const c_void,
+    ) -> u32 {
+        let f = REAL_CREATE.load(Ordering::Acquire);
+        if f == 0 {
+            return 1;
+        }
+        // SAFETY: `f` is the real `ffxCreateContext` entry point from the title's FSR DLL.
+        let rc = unsafe { std::mem::transmute::<usize, FfxCreateFn>(f)(ctx, desc, alloc) };
+        if rc == 0 {
+            let desc_type = if !desc.is_null() {
+                // SAFETY: `ffxCreateContext` succeeded so `desc` starts with `ffxApiHeader`.
+                unsafe { desc.cast::<u64>().read_unaligned() }
+            } else {
+                0
+            };
+            victory_gpu::fsr::note_context_created(desc_type, (0, 0), (0, 0));
+        }
+        rc
+    }
+
+    extern "C" fn hook_ffx_destroy(ctx: *mut *mut c_void, alloc: *const c_void) -> u32 {
+        let f = REAL_DESTROY.load(Ordering::Acquire);
+        if f == 0 {
+            return 1;
+        }
+        // SAFETY: `f` is the real `ffxDestroyContext` entry point.
+        let rc = unsafe { std::mem::transmute::<usize, FfxDestroyFn>(f)(ctx, alloc) };
+        if rc == 0 {
+            victory_gpu::fsr::note_context_destroyed();
+        }
+        rc
+    }
+
+    extern "C" fn hook_ffx_dispatch(ctx: *mut *mut c_void, desc: *const c_void) -> u32 {
+        victory_gpu::fsr::note_dispatch_raw(desc);
+        let f = REAL_DISPATCH.load(Ordering::Acquire);
+        if f == 0 {
+            return 1;
+        }
+        // SAFETY: `f` is the real `ffxDispatch` entry point.
+        unsafe { std::mem::transmute::<usize, FfxDispatchFn>(f)(ctx, desc) }
+    }
+
+    extern "C" fn hook_ffx_query(ctx: *mut *mut c_void, desc: *mut c_void) -> u32 {
+        victory_gpu::fsr::apply_ffx_query_override(desc);
+        let f = REAL_QUERY.load(Ordering::Acquire);
+        if f == 0 {
+            return 1;
+        }
+        // SAFETY: `f` is the real `ffxQuery` entry point.
+        unsafe { std::mem::transmute::<usize, FfxQueryFn>(f)(ctx, desc) }
+    }
+
+    let sym = narrow(name);
+    match sym.as_str() {
+        "ffxCreateContext" => {
+            REAL_CREATE.store(resolved as usize, Ordering::Release);
+            hook_ffx_create as *const () as *mut c_void
+        }
+        "ffxDestroyContext" => {
+            REAL_DESTROY.store(resolved as usize, Ordering::Release);
+            hook_ffx_destroy as *const () as *mut c_void
+        }
+        "ffxDispatch" => {
+            REAL_DISPATCH.store(resolved as usize, Ordering::Release);
+            hook_ffx_dispatch as *const () as *mut c_void
+        }
+        "ffxQuery" => {
+            REAL_QUERY.store(resolved as usize, Ordering::Release);
+            hook_ffx_query as *const () as *mut c_void
+        }
+        _ => resolved,
     }
 }
 
@@ -311,7 +423,13 @@ fn find_module(path: &str, load: bool) -> Option<*mut c_void> {
     // another thread is still initialising, as the Windows loader lock does.
     if load {
         match runtime::load_title_dll(&file) {
-            Ok(Some(base)) => return Some(base as *mut c_void),
+            Ok(Some(base)) => {
+                if file.eq_ignore_ascii_case(victory_gpu::fsr::FSR_XBOX_DLL_NAME) {
+                    let loaded_path = runtime::image_path(base);
+                    victory_gpu::fsr::note_dll_loaded(loaded_path.as_deref());
+                }
+                return Some(base as *mut c_void);
+            }
             Ok(None) => {}
             // Not the host: it would load the unpatched DLL from the title's folder.
             Err(error) => {

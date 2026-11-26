@@ -177,6 +177,14 @@ pub(crate) fn record_placed_aliasing_copies(
     if this.is_null() {
         return resolved;
     }
+    // Lock-free fast path: committed resources are never registered in `UMA_ALIASING`,
+    // and buffers have no `HostTexture` copy (`made_copy` always returns `None`), so
+    // skip the global tracker mutex on hot `ensure_state` / `barrier` paths across
+    // parallel `VICTORY_THIN` recording threads.
+    let r = resource(this);
+    if r.desc.dimension == BUFFER || matches!(r.backing, Backing::Committed(_)) {
+        return resolved;
+    }
     use crate::graphics::contracts::{AliasingTracker, ResourceId};
     let mut tracker = uma_aliasing_tracker()
         .lock()
@@ -428,6 +436,93 @@ pub(crate) fn stands_in(this: This) -> bool {
 pub(crate) static DEPTH_UNORDERED: [std::sync::atomic::AtomicU64; 4] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
+/// Shadow map resolution multiplier per axis (`VICTORY_SHADOW_SCALE`, default
+/// `2`, which renders 2× width × 2× height = 4× pixel count for shadow maps).
+/// Accepts `2` / `4x` (4× pixels), `1` / `0` / `off` (native), or `3`/`4`.
+#[cfg(windows)]
+pub(crate) fn shadow_quality_scale() -> u32 {
+    static SCALE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *SCALE.get_or_init(|| {
+        parse_shadow_scale(std::env::var("VICTORY_SHADOW_SCALE").ok().as_deref())
+    })
+}
+
+#[cfg(any(windows, test))]
+fn parse_shadow_scale(raw: Option<&str>) -> u32 {
+    match raw.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        Some("0" | "1" | "1x" | "off" | "native") => 1,
+        Some("2" | "2x" | "4x" | "high" | "ultra") | None => 2,
+        Some("3" | "9x") => 3,
+        Some("4" | "16x") => 4,
+        Some(v) => v.parse::<u32>().ok().map_or(2, |n| n.clamp(1, 4)),
+    }
+}
+
+#[cfg(windows)]
+fn shadow_max_dim() -> u64 {
+    static MAX: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MAX.get_or_init(|| {
+        std::env::var("VICTORY_SHADOW_MAX_DIM")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(8192, |v| v.clamp(2048, 16384))
+    })
+}
+
+/// Pure predicate deciding whether a depth-stencil texture description is a
+/// shadow map / cascade atlas eligible for `scale × scale` upscaling.
+#[cfg(any(windows, test))]
+fn shadow_scale_for_desc(desc: &ResourceDesc, scale: u32, max_dim: u64) -> u32 {
+    const TEXTURE_2D: u32 = 3;
+    const TARGET: u32 = 1;
+    const DEPTH: u32 = 2;
+    const DENY_SHADER_RESOURCE: u32 = 8;
+    if scale <= 1
+        || desc.dimension != TEXTURE_2D
+        || (desc.flags & DEPTH) == 0
+        || (desc.flags & TARGET) != 0
+        || (desc.flags & DENY_SHADER_RESOURCE) != 0
+        || desc.sample_count > 1
+    {
+        return 1;
+    }
+    let (w, h) = (desc.width, u64::from(desc.height));
+    if !w.is_power_of_two() || !h.is_power_of_two() || w < 256 || h < 256 {
+        return 1;
+    }
+    if w.max(h) > w.min(h).saturating_mul(4) {
+        return 1;
+    }
+    let s = u64::from(scale);
+    if w.saturating_mul(s) > max_dim || h.saturating_mul(s) > max_dim {
+        return 1;
+    }
+    scale
+}
+
+#[cfg(windows)]
+fn shadow_scale_for(desc: &ResourceDesc) -> u32 {
+    shadow_scale_for_desc(desc, shadow_quality_scale(), shadow_max_dim())
+}
+
+#[cfg(windows)]
+static SHADOW_MAPS_SCALED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(windows)]
+pub(crate) fn shadow_maps_scaled_count() -> u64 {
+    SHADOW_MAPS_SCALED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Returns the per-axis host resolution multiplier (`1` normally, `2` for 4×
+/// pixel shadow maps) for title resource `this`.
+#[cfg(windows)]
+pub(crate) fn shadow_scale(this: This) -> u32 {
+    if this.is_null() {
+        return 1;
+    }
+    shadow_scale_for(&resource(this).desc)
+}
+
 /// Whether the title asked for both depth and unordered access for `this`.
 #[cfg(windows)]
 pub(crate) fn depth_and_unordered(this: This) -> bool {
@@ -579,6 +674,11 @@ fn twin_texture(
     }
     let host = crate::host::host()?;
     let mut d = *desc;
+    let s = shadow_scale_for(desc);
+    if s > 1 {
+        d.width *= u64::from(s);
+        d.height *= s;
+    }
     d.layout = 0;
     d.alignment = 0;
     d.flags = UNORDERED;
@@ -1863,10 +1963,19 @@ pub(crate) fn room_lately() -> bool {
 fn room_percent() -> u64 {
     static PERCENT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *PERCENT.get_or_init(|| {
+        let default = if crate::host::is_nvidia()
+            && crate::host::host()
+                .and_then(|h| h.video_memory())
+                .is_some_and(|[budget, ..]| budget >= 10 << 30)
+        {
+            93
+        } else {
+            90
+        };
         std::env::var("VICTORY_TEXTURE_ROOM_PERCENT")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or(90, |percent| percent.clamp(50, 97))
+            .map_or(default, |percent| percent.clamp(50, 97))
     })
 }
 
@@ -2530,6 +2639,22 @@ fn host_texture_as(
     }
     let host = crate::host::host()?;
     let mut d = *desc;
+    let s = shadow_scale_for(desc);
+    if s > 1 {
+        let (orig_w, orig_h) = (d.width, d.height);
+        d.width *= u64::from(s);
+        d.height *= s;
+        let n = SHADOW_MAPS_SCALED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if n <= 8 || n.is_power_of_two() {
+            tracing::info!(
+                from = format_args!("{orig_w}x{orig_h}"),
+                to = format_args!("{}x{}", d.width, d.height),
+                pixels_x = s * s,
+                count = n,
+                "shadow map render resolution increased"
+            );
+        }
+    }
     d.layout = 0;
     d.alignment = 0;
     d.flags &= PC_FLAGS;
@@ -4694,6 +4819,40 @@ float4 lit() : SV_Target { return 1.0; }
         assert_eq!(texture_floor_bytes(Some(12 * GIB)), 2 * GIB);
         assert_eq!(texture_floor_bytes(Some(24 * GIB)), 2 * GIB);
         assert_eq!(texture_floor_bytes(Some(32 * GIB)), 2 * GIB);
+    }
+
+    #[test]
+    fn shadow_scale_targets_shadow_maps_and_skips_screen_depth() {
+        let depth_desc = |w: u64, h: u32, flags: u32, samples: u32| ResourceDesc {
+            dimension: 3,
+            alignment: 0,
+            width: w,
+            height: h,
+            depth_or_array_size: 1,
+            mip_levels: 1,
+            format: 40, // D32_FLOAT
+            sample_count: samples,
+            sample_quality: 0,
+            layout: 0,
+            flags,
+        };
+        assert_eq!(parse_shadow_scale(None), 2);
+        assert_eq!(parse_shadow_scale(Some("4x")), 2);
+        assert_eq!(parse_shadow_scale(Some("1")), 1);
+        assert_eq!(parse_shadow_scale(Some("off")), 1);
+        // Square & atlas power-of-two shadow maps scale 2x per axis (4x pixels).
+        assert_eq!(shadow_scale_for_desc(&depth_desc(1024, 1024, 2, 1), 2, 8192), 2);
+        assert_eq!(shadow_scale_for_desc(&depth_desc(2048, 2048, 6, 1), 2, 8192), 2);
+        assert_eq!(shadow_scale_for_desc(&depth_desc(4096, 2048, 2, 1), 2, 8192), 2);
+        // 16:9 screen depth targets are never scaled.
+        assert_eq!(shadow_scale_for_desc(&depth_desc(1920, 1080, 2, 1), 2, 8192), 1);
+        assert_eq!(shadow_scale_for_desc(&depth_desc(2560, 1440, 6, 1), 2, 8192), 1);
+        assert_eq!(shadow_scale_for_desc(&depth_desc(1280, 720, 2, 1), 2, 8192), 1);
+        // MSAA, render targets, deny-SRV, or exceeding max_dim are never scaled.
+        assert_eq!(shadow_scale_for_desc(&depth_desc(1024, 1024, 2, 4), 2, 8192), 1);
+        assert_eq!(shadow_scale_for_desc(&depth_desc(1024, 1024, 1 | 2, 1), 2, 8192), 1);
+        assert_eq!(shadow_scale_for_desc(&depth_desc(1024, 1024, 2 | 8, 1), 2, 8192), 1);
+        assert_eq!(shadow_scale_for_desc(&depth_desc(8192, 8192, 2, 1), 2, 8192), 1);
     }
 
     /// A placed texture viewed from a later level has a host copy of that

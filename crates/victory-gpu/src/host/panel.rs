@@ -26,8 +26,8 @@ const EVERY: Duration = Duration::from_millis(500);
 const GLYPH: (u32, u32) = (5, 7);
 const CELL: (u32, u32) = (6, 9);
 /// Characters in a line, lines, and the box's rim in dots.
-const COLUMNS: u32 = 40;
-const LINES: u32 = 9;
+const COLUMNS: u32 = 44;
+const LINES: u32 = 11;
 const RIM: u32 = 3;
 
 /// The texts are put into one of these in turn: the card reads the others,
@@ -36,7 +36,9 @@ const UPLOADS: usize = 4;
 
 fn asked() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| crate::switch::on("VICTORY_PANEL"))
+    // In diagnostics builds (`diag/victory.exe`), show the HUD panel by default
+    // unless explicitly turned off with `VICTORY_PANEL=0` (F3 still toggles it).
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PANEL").is_none_or(|v| v != "0"))
 }
 
 /// Whether it is shown now.
@@ -212,8 +214,32 @@ fn text(c: &[f64; COUNTERS], ms: f64, worst: f64, cost: f64, host: &Host) -> Vec
     let (working, private) = crate::copystat::process_memory();
     let [budget, used, _, shared] = host.video_memory().unwrap_or_default();
     let idle = (c[1] / 1e3).min(ms);
+    let game_fps = 1e3 / ms.max(0.001);
+    let st = crate::fsr::status();
+    let fsr_tag = if st.fsr_active {
+        "ON"
+    } else if st.fsr_dll_loaded {
+        "LOADED"
+    } else if st.fsr_dll_present {
+        "READY"
+    } else {
+        "OFF"
+    };
+    let fg_tag = if st.framegen_active {
+        "ON"
+    } else if st.framegen_enabled {
+        "ARMED"
+    } else {
+        "OFF"
+    };
+    let fg_fps = if st.framegen_active { game_fps * 2.0 } else { game_fps };
+    let shd_x = st.shadow_scale * st.shadow_scale;
+    let up_tag = st.upscaler.label();
+    let qual_tag = st.render_quality.short_label();
     vec![
-        format!("FPS {:.1}  FRAME {ms:.1} MS  LONGEST {worst:.0}", 1e3 / ms.max(0.001)),
+        format!("FPS {:.1}  FRAME {ms:.1} MS  LONGEST {worst:.0}", game_fps),
+        format!("UP {up_tag} {qual_tag}  FSR {fsr_tag}  FG {fg_tag} {}", st.framegen_mode),
+        format!("DISP {fg_fps:.1}  GEN {}  SHD {shd_x}X  F10 MENU", st.framegen_generated),
         format!("DRAWS {:.0}  DROPPED {:.0}", c[10], c[8]),
         format!("SUBMIT BUSY {:.1}  WAITS FOR GPU {:.1}", c[0] / 1e3, c[3] / 1e3),
         format!("GPU BUSY {:.1}  IDLE BEHIND US {:.1}", ms - idle, c[2] / 1e3),

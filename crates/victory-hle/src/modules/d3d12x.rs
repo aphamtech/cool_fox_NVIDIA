@@ -51,6 +51,20 @@ pub fn host_wave_max() -> Option<u32> {
     }
 }
 
+/// Fingerprint of the current shader translator build, environment switches,
+/// and host GPU settings (used to skip redundant precompile passes when the
+/// cache is already up to date).
+pub fn shader_translation_key() -> Option<[u8; 32]> {
+    #[cfg(windows)]
+    {
+        Some(victory_gpu::shader_cache::translation_key())
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
 /// Translates the console shader `container` into the shader cache a run
 /// reads (with [`use_shader_cache`]), returning `(emitted_dxil, was_cached)`.
 pub fn precompile_shader(container: &[u8]) -> Result<(Vec<u8>, bool), String> {

@@ -128,6 +128,24 @@ pub fn run(
         Console::SeriesS => victory_hle::console::Console::SeriesS,
     });
     println!("console        {}", victory_hle::console::current().name());
+    let _ = victory_hle::fsr::probe_game_dir(title_dir);
+    {
+        let st = victory_hle::fsr::status();
+        let fsr_desc = match &st.fsr_dll_path {
+            Some(p) => format!("READY ({})", p.display()),
+            None => "DISABLED (amd_fidelityfx_upscaler_xbox.dll not found in game dir)".to_owned(),
+        };
+        let fg_desc = if st.framegen_enabled {
+            format!("ENABLED (2x, mode={}, triggered by amd_fidelityfx_upscaler_xbox.dll / VICTORY_FRAMEGEN)", st.framegen_mode)
+        } else {
+            "DISABLED (set VICTORY_FRAMEGEN=1 or place amd_fidelityfx_upscaler_xbox.dll in game dir)".to_owned()
+        };
+        let shd_x = st.shadow_scale * st.shadow_scale;
+        println!("upscaler       {} (quality: {}, press F10 in-game for menu)", st.upscaler.label(), st.render_quality.label());
+        println!("fsr            {fsr_desc}");
+        println!("framegen       {fg_desc}");
+        println!("shadows        {shd_x}x quality ({}x{} resolution scaling)", st.shadow_scale, st.shadow_scale);
+    }
     let dlls = victory_loader::load_title_dlls(image.info(), title_dir, &images, &wanted)?;
     for (name, dll) in &dlls {
         println!("title dll      {name} at {:#x}", dll.base());

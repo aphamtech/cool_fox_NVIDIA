@@ -21,12 +21,26 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
 use windows::core::Interface;
 
-/// About 2 ms at full clocks: 500 sends a second.
+/// About 2 ms at full clocks: 500 sends a second (AMD Wave64).
 const COUNT: &str = r#"
 #define RS "UAV(u0)"
 RWByteAddressBuffer sum : register(u0);
 [RootSignature(RS)]
 [numthreads(64, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    uint x = id.x;
+    [loop] for (uint i = 0; i < 400000u; i++) x = x * 1664525u + 1013904223u;
+    sum.Store(id.x * 4u, x);
+}
+"#;
+
+/// Wave32 single-warp variant for NVIDIA GPUs: keeps boost clocks locked
+/// across submission gaps while occupying only one warp.
+const COUNT_WAVE32: &str = r#"
+#define RS "UAV(u0)"
+RWByteAddressBuffer sum : register(u0);
+[RootSignature(RS)]
+[numthreads(32, 1, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
     uint x = id.x;
     [loop] for (uint i = 0; i < 400000u; i++) x = x * 1664525u + 1013904223u;
@@ -64,8 +78,10 @@ enum Mode {
 fn mode() -> Mode {
     static MODE: OnceLock<Mode> = OnceLock::new();
     *MODE.get_or_init(|| match std::env::var("VICTORY_CARD_AWAKE").as_deref() {
+        Ok("0") => Mode::Off,
         Ok("1") => Mode::On,
         Ok("turns") => Mode::ByTurns,
+        _ if crate::host::is_nvidia() => Mode::On,
         _ => Mode::Off,
     })
 }
@@ -121,7 +137,8 @@ pub(crate) fn start(device: &ID3D12Device, wanted: impl Fn() -> bool + Send + 's
 }
 
 fn run(device: &ID3D12Device, wanted: &dyn Fn() -> bool, stop: &AtomicBool) -> windows::core::Result<()> {
-    let code = super::compile(COUNT, windows::core::s!("main"), windows::core::s!("cs_5_1"))?;
+    let source = if crate::host::is_nvidia() { COUNT_WAVE32 } else { COUNT };
+    let code = super::compile(source, windows::core::s!("main"), windows::core::s!("cs_5_1"))?;
     // SAFETY: plain object creation; the code lives through the calls, the
     // root signature is inside it. Two closed lists, sent in turn, whose
     // objects live until what was sent last has run.

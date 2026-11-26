@@ -53,6 +53,9 @@ if not defined VICTORY_JOIN_PARTS set "VICTORY_JOIN_PARTS=8"
 if not defined VICTORY_UPLOAD_AHEAD set "VICTORY_UPLOAD_AHEAD=1"
 if not defined VICTORY_LEVELS_ON_DEMAND set "VICTORY_LEVELS_ON_DEMAND=1"
 if not defined VICTORY_CARD_BUFFERS_MIN_KB set "VICTORY_CARD_BUFFERS_MIN_KB=64"
+if not defined VICTORY_DLSS set "VICTORY_DLSS=auto"
+if not defined VICTORY_FRAMEGEN set "VICTORY_FRAMEGEN=auto"
+if not defined VICTORY_SHADOW_SCALE set "VICTORY_SHADOW_SCALE=2"
 if not defined VICTORY_LOG if not defined RUST_LOG set "VICTORY_LOG=warn"
 "%runner%" run "%VICTORY_GAME_DIR%\game_scarlett_master.exe" --console series-s --execute %PRECOMPILE_FLAG%
 exit /b %errorlevel%

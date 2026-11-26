@@ -100,6 +100,13 @@ pub(crate) fn translation() -> [u8; 32] {
     build()
 }
 
+/// Public fingerprint of the current translator build, shader environment
+/// switches, and host GPU settings (for fast precompile up-to-date checks).
+pub fn translation_key() -> [u8; 32] {
+    let _ = crate::host::host();
+    build()
+}
+
 /// The widest wave this host's GPU runs (`WaveLaneCountMax`): 32 on NVIDIA,
 /// 64 on AMD RDNA. A run translates shaders for what its device reports and
 /// the cache keys on it, so precompilation queries the same value.

@@ -22,6 +22,8 @@ mod capture;
 #[cfg(windows)]
 mod compose;
 pub mod console;
+#[cfg(windows)]
+mod dlss;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -35,6 +37,9 @@ mod draw;
 pub mod dxgi;
 pub mod fence;
 pub mod frame;
+#[cfg(windows)]
+pub(crate) mod framegen;
+pub mod fsr;
 pub mod graphics;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod book;

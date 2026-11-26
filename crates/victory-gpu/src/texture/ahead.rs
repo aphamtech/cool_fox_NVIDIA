@@ -35,15 +35,28 @@ pub(crate) const LISTED: u8 = 3;
 const MOST: u64 = 96 << 20;
 /// Bytes and textures of one submission at most.
 const BATCH: (u64, usize) = (16 << 20, 64);
+/// Larger async DMA copy batches for discrete NVIDIA copy engines.
+const NVIDIA_BATCH: (u64, usize) = (32 << 20, 128);
 
-/// Whether it is on (`VICTORY_UPLOAD_AHEAD`; off).
+/// Whether it is on (`VICTORY_UPLOAD_AHEAD`; on by default on discrete NVIDIA GPUs).
 pub(crate) fn on() -> bool {
     #[cfg(feature = "diagnostics")]
     if let Some(on) = crate::ab::pick("VICTORY_UPLOAD_AHEAD") {
         return on;
     }
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_UPLOAD_AHEAD").is_some_and(|v| v != "0"))
+    *ON.get_or_init(|| match std::env::var_os("VICTORY_UPLOAD_AHEAD") {
+        Some(v) => v != "0",
+        None => crate::host::is_nvidia(),
+    })
+}
+
+fn batch_limits() -> (u64, usize) {
+    if crate::host::is_nvidia() {
+        NVIDIA_BATCH
+    } else {
+        BATCH
+    }
 }
 
 /// An upload on its way.
@@ -203,7 +216,12 @@ fn workers() -> Option<&'static ID3D12CommandQueue> {
                     })
                     .ok()?
             };
-            for n in 0..2 {
+            let count = if host.is_nvidia() && !crate::residency::limited_host_ram() {
+                3
+            } else {
+                2
+            };
+            for n in 0..count {
                 let worker = Worker::new(&host.device, queue.clone()).ok()?;
                 std::thread::Builder::new().name(format!("uploads ahead {n}")).spawn(move || worker.work()).ok()?;
             }
@@ -244,8 +262,9 @@ impl Worker {
                 while queue.is_empty() {
                     queue = QUEUE.1.wait(queue).unwrap_or_else(|e| e.into_inner());
                 }
+                let (max_bytes, max_jobs) = batch_limits();
                 let mut bytes = 0;
-                while bytes < BATCH.0 && jobs.len() < BATCH.1
+                while bytes < max_bytes && jobs.len() < max_jobs
                     && let Some(job) = queue.pop_front()
                 {
                     bytes += job.staging.read as u64;

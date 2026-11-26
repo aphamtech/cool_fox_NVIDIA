@@ -45,7 +45,14 @@ impl Fields {
         let filter = if aniso {
             0x55
         } else {
-            linear(self.min) << 4 | linear(self.mag) << 2 | u32::from(self.mip == 2)
+            let f = linear(self.min) << 4 | linear(self.mag) << 2 | u32::from(self.mip == 2);
+            // Upgrade point shadow comparison samplers to hardware bilinear PCF
+            // when 4x shadow quality scaling is enabled.
+            if reduction == 1 && f == 0 && crate::resource::shadow_quality_scale() > 1 {
+                0x14
+            } else {
+                f
+            }
         };
         let min_lod = finite_lod(self.min_lod, 0.0);
         // Without a mip filter the console clamps sampling to `min_lod`.

@@ -3,6 +3,17 @@
 //! Every command reads the user's own files and writes only to stdout or to
 //! the user's cache directory (outside the repository).
 
+/// Request the discrete NVIDIA GPU and high-performance power profile on
+/// hybrid/Optimus systems.
+#[cfg(windows)]
+#[unsafe(no_mangle)]
+pub static NvOptimusEnablement: u32 = 1;
+
+/// Request the high-performance discrete GPU on AMD PowerXpress systems.
+#[cfg(windows)]
+#[unsafe(no_mangle)]
+pub static AmdPowerXpressRequestHighPerformance: u32 = 1;
+
 mod census;
 mod inspect;
 mod precompile;

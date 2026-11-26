@@ -154,6 +154,35 @@ fn collect_candidates(
     files
 }
 
+/// Computes a fingerprint of the current shader translator settings + candidate
+/// file set (path, size, mtime) so repeat launches can skip re-reading and
+/// re-hashing hundreds of MB of game archives when the cache is already warm.
+fn compute_precompile_stamp(key: [u8; 32], files: &[(PathBuf, u64)]) -> String {
+    let mut h = blake3::Hasher::new();
+    h.update(b"victory-precompile-stamp-v1");
+    h.update(&key);
+    let mut entries: Vec<(String, u64, u128)> = files
+        .iter()
+        .map(|(path, len)| {
+            let mtime = std::fs::metadata(path)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |d| d.as_nanos());
+            (path.to_string_lossy().into_owned(), *len, mtime)
+        })
+        .collect();
+    entries.sort_unstable();
+    h.update(&(entries.len() as u64).to_le_bytes());
+    for (p, len, mtime) in entries {
+        h.update(&(p.len() as u64).to_le_bytes());
+        h.update(p.as_bytes());
+        h.update(&len.to_le_bytes());
+        h.update(&mtime.to_le_bytes());
+    }
+    h.finalize().to_hex().to_string()
+}
+
 pub fn run(options: Options) -> Result<()> {
     let paths = crate::default_paths(options.paths)?;
     // Query the host GPU first so the host D3D12 device (and `host_rdna` /
@@ -199,19 +228,41 @@ pub fn run(options: Options) -> Result<()> {
         anyhow::bail!("--validate requires Windows (dxil.dll)");
     }
 
+    let started = Instant::now();
+    let files = collect_candidates(&paths, &cfg.cache_dir, &cfg.data_dir, || false);
+
+    // Fast path for repeat launches: if the translator key + game file
+    // manifest match `.precompile-stamp` and neither `--validate` nor
+    // `--strict` was requested, skip re-scanning archives and avoid flashing
+    // the progress window.
+    let stamp_path = dir.join(".precompile-stamp");
+    let stamp_value = (!options.validate && !options.strict)
+        .then(|| {
+            victory_hle::modules::d3d12x::shader_translation_key()
+                .map(|key| compute_precompile_stamp(key, &files))
+        })
+        .flatten();
+    if let Some(ref expected) = stamp_value
+        && let Ok(existing) = std::fs::read_to_string(&stamp_path)
+        && existing.trim() == expected.as_str()
+    {
+        println!(
+            "precompile   up to date ({} files verified in {:.2} s)",
+            files.len(),
+            started.elapsed().as_secs_f64()
+        );
+        return Ok(());
+    }
+
     let progress = options
         .gui
         .then(|| Progress::new("VIctory — Precompiling Shaders", options.allow_skip));
 
-    let started = Instant::now();
     let threads = options
         .jobs
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()))
         .max(1);
 
-    let files = collect_candidates(&paths, &cfg.cache_dir, &cfg.data_dir, || {
-        progress.as_ref().is_some_and(Progress::is_cancelled)
-    });
     let total_files = files.len() as u64;
     let total_bytes: u64 = files.iter().map(|(_, len)| *len).sum();
     if let Some(p) = &progress {
@@ -352,12 +403,22 @@ pub fn run(options: Options) -> Result<()> {
             println!("  {n:>7}  {reason}  (e.g. {example})");
         }
     }
-    println!(
-        "cache        {} entries, {:.0} MB; {:.1} s",
-        count(&dir),
-        bytes(&dir) as f64 / (1 << 20) as f64,
-        started.elapsed().as_secs_f64()
-    );
+    if !cancelled && let Some(ref stamp) = stamp_value {
+        let _ = std::fs::write(&stamp_path, stamp);
+    }
+    if options.allow_skip {
+        println!(
+            "cache        ready ({:.1} s)",
+            started.elapsed().as_secs_f64()
+        );
+    } else {
+        let (entries, total_bytes) = cache_stats(&dir);
+        println!(
+            "cache        {entries} entries, {:.0} MB; {:.1} s",
+            total_bytes as f64 / (1 << 20) as f64,
+            started.elapsed().as_secs_f64()
+        );
+    }
     if options.strict && !cancelled && !failed.is_empty() {
         anyhow::bail!("{} containers failed", failed.len());
     }
@@ -450,22 +511,18 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-fn count(dir: &Path) -> usize {
-    walkdir::WalkDir::new(dir)
-        .into_iter()
-        .filter_map(Result::ok)
-        .filter(|e| e.file_type().is_file())
-        .count()
-}
-
-fn bytes(dir: &Path) -> u64 {
-    walkdir::WalkDir::new(dir)
-        .into_iter()
-        .filter_map(Result::ok)
-        .filter_map(|e| e.metadata().ok())
-        .filter(|m| m.is_file())
-        .map(|m| m.len())
-        .sum()
+fn cache_stats(dir: &Path) -> (usize, u64) {
+    let mut entries = 0usize;
+    let mut total_bytes = 0u64;
+    for entry in walkdir::WalkDir::new(dir).into_iter().filter_map(Result::ok) {
+        if let Ok(meta) = entry.metadata()
+            && meta.is_file()
+        {
+            entries += 1;
+            total_bytes += meta.len();
+        }
+    }
+    (entries, total_bytes)
 }
 
 #[cfg(test)]
