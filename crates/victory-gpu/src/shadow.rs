@@ -53,6 +53,9 @@ pub(crate) struct Shadow {
     /// Ranges shaders of a submission not yet copied back may be writing:
     /// title memory there is older than the copy.
     pending: Mutex<Vec<(usize, usize)>>,
+    /// Lock-free fast check for whether `pending` is non-empty (avoids locking
+    /// `pending` and allocating a Vec on 99% of `update` / `nothing_new` calls).
+    has_pending: std::sync::atomic::AtomicBool,
     /// With [`relay`]: how many submissions not yet copied back declared
     /// each range of `pending` ([`Flights`]). Locked inside `pending`'s
     /// lock.
@@ -802,17 +805,96 @@ pub(crate) fn stale_pages(most: usize, say: &mut dyn FnMut(&Shadow, usize, usize
     done
 }
 
-/// Copies of memory (from, to, bytes: apart), on several threads if they are
-/// many.
+/// Non-temporal streaming copy into Write-Combined GPU upload memory.
+/// Bypasses L1/L2/L3 cache (preserving 3D V-Cache for game + shadow working
+/// sets) while issuing full 32-byte burst writes to WC buffers.
+///
+/// # Safety
+/// `src` and `dst` must be valid, non-overlapping regions of `len` bytes.
+#[inline]
+pub(crate) unsafe fn copy_wc(src: *const u8, dst: *mut u8, len: usize) {
+    #[cfg(target_arch = "x86_64")]
+    if len >= 256 && std::arch::is_x86_feature_detected!("avx2") {
+        // SAFETY: AVX2 supported and caller guarantees non-overlapping ranges.
+        unsafe { copy_wc_avx2(src, dst, len) };
+        return;
+    }
+    // SAFETY: caller guarantees valid non-overlapping ranges.
+    unsafe { std::ptr::copy_nonoverlapping(src, dst, len) };
+}
+
+/// # Safety
+/// AVX2 available; `src` and `dst` are valid, non-overlapping regions of `len` bytes.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn copy_wc_avx2(src: *const u8, dst: *mut u8, len: usize) {
+    use std::arch::x86_64::*;
+    let mut at = 0usize;
+    // Align destination to 32 bytes for `_mm256_stream_si256`.
+    let misalign = dst.addr() & 31;
+    if misalign != 0 {
+        let head = (32 - misalign).min(len);
+        // SAFETY: within `len`.
+        unsafe { std::ptr::copy_nonoverlapping(src, dst, head) };
+        at = head;
+    }
+    // Stream 128 bytes (2 cache lines) per iteration directly to WC buffers.
+    while at + 128 <= len {
+        // SAFETY: `dst.add(at)` is 32-byte aligned and `at + 128 <= len`.
+        unsafe {
+            let v0 = _mm256_loadu_si256(src.add(at).cast::<__m256i>());
+            let v1 = _mm256_loadu_si256(src.add(at + 32).cast::<__m256i>());
+            let v2 = _mm256_loadu_si256(src.add(at + 64).cast::<__m256i>());
+            let v3 = _mm256_loadu_si256(src.add(at + 96).cast::<__m256i>());
+            _mm256_stream_si256(dst.add(at).cast::<__m256i>(), v0);
+            _mm256_stream_si256(dst.add(at + 32).cast::<__m256i>(), v1);
+            _mm256_stream_si256(dst.add(at + 64).cast::<__m256i>(), v2);
+            _mm256_stream_si256(dst.add(at + 96).cast::<__m256i>(), v3);
+        }
+        at += 128;
+    }
+    while at + 32 <= len {
+        // SAFETY: `dst.add(at)` is 32-byte aligned and `at + 32 <= len`.
+        unsafe {
+            let v = _mm256_loadu_si256(src.add(at).cast::<__m256i>());
+            _mm256_stream_si256(dst.add(at).cast::<__m256i>(), v);
+        }
+        at += 32;
+    }
+    if at < len {
+        // SAFETY: remaining tail bytes within `len`.
+        unsafe { std::ptr::copy_nonoverlapping(src.add(at), dst.add(at), len - at) };
+    }
+    _mm_sfence();
+}
+
+/// Copies of memory (from, to, bytes: apart) into Write-Combined GPU upload
+/// memory, spread across threads in L2-sized chunks with non-temporal stores
+/// so L3 cache (96 MB 3D V-Cache) is not evicted by write-only GPU uploads.
 pub(crate) fn copy_all(copies: Vec<(usize, usize, usize)>) {
+    const PARALLEL_MIN: usize = 512 << 10;
+    const WC_CHUNK: usize = 256 << 10;
     let bytes: usize = copies.iter().map(|c| c.2).sum();
-    if bytes > 4 << 20 {
-        wide(copy_jobs(copies));
+    if bytes >= PARALLEL_MIN {
+        let mut chunks: Vec<(usize, usize, usize)> = Vec::with_capacity(copies.len() + bytes / WC_CHUNK);
+        for (src, dst, len) in copies {
+            let mut at = 0;
+            while at < len {
+                let n = WC_CHUNK.min(len - at);
+                chunks.push((src + at, dst + at, n));
+                at += n;
+            }
+        }
+        wide_each(chunks.len(), move |i| {
+            let (src, dst, len) = chunks[i];
+            // SAFETY: caller's disjoint ranges.
+            unsafe { copy_wc(src as *const u8, dst as *mut u8, len) };
+        });
         return;
     }
     for (src, dst, len) in copies {
         // SAFETY: the caller's ranges.
-        unsafe { std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, len) };
+        unsafe { copy_wc(src as *const u8, dst as *mut u8, len) };
     }
 }
 
@@ -1628,12 +1710,23 @@ fn workers() -> &'static Workers {
 
 /// Runs `jobs` on the kept threads and on this one, and returns when all
 /// of them are done. The jobs copy and compare memory; they do not panic.
+/// Avoids nesting parallel pool waits when already executing inside a worker
+/// job (which would otherwise serialize or starve the shared worker queue).
 fn wide(jobs: Vec<Job>) {
-    if jobs.len() < 2 {
+    thread_local! {
+        static IN_WIDE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    if jobs.len() < 2 || IN_WIDE.get() {
         for job in jobs {
             job();
         }
         return;
+    }
+    struct Guard;
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            IN_WIDE.with(|f| f.set(false));
+        }
     }
     let workers = workers();
     let _wide = crate::timeline::span("work spread over threads");
@@ -1644,6 +1737,8 @@ fn wide(jobs: Vec<Job>) {
             let left = left.clone();
             workers.there.fetch_add(1, Ordering::AcqRel);
             queue.push_back(Box::new(move || {
+                IN_WIDE.with(|f| f.set(true));
+                let _g = Guard;
                 job();
                 let mut n = left.0.lock().unwrap_or_else(|e| e.into_inner());
                 *n -= 1;
@@ -2977,6 +3072,14 @@ unsafe impl Send for Shadow {}
 // SAFETY: as above.
 unsafe impl Sync for Shadow {}
 
+/// Bytes refreshed by copy destination kind since the last frame-rate log:
+/// `[carded_cpu_side, rebar_gpu_upload, plain_shared]`.
+static COPY_KIND_BYTES: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+pub(crate) fn copy_kind_bytes() -> [u64; 3] {
+    [0, 1, 2].map(|i| COPY_KIND_BYTES[i].swap(0, Ordering::Relaxed))
+}
+
 impl Shadow {
     /// The host GPU address of a title address inside the buffer.
     pub(crate) fn gpu(&self, address: u64) -> u64 {
@@ -3074,6 +3177,7 @@ impl Shadow {
             ranged: Mutex::default(),
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
+            has_pending: std::sync::atomic::AtomicBool::new(false),
             flights: Mutex::default(),
             before: Mutex::default(),
             merging: RwLock::default(),
@@ -3152,6 +3256,8 @@ impl Shadow {
         // lists).
         if self.card.is_some() {
             pending.push(range);
+        self.has_pending.store(true, Ordering::Release);
+            self.has_pending.store(true, Ordering::Release);
             return;
         }
         // The parts no declared range holds yet: their bytes are taken now,
@@ -3176,6 +3282,7 @@ impl Shadow {
             parts = rest;
         }
         pending.push(range);
+        self.has_pending.store(true, Ordering::Release);
         let taken: usize = parts.iter().map(|&(from, to)| to.saturating_sub(from)).sum();
         BACK_CLASS[usize::from(!self.window)].fetch_add(taken as u64, Ordering::Relaxed);
         let total = self.len as usize;
@@ -3465,6 +3572,9 @@ impl Shadow {
         } else {
             pending.retain(|r| !ranges.contains(r));
         }
+        if pending.is_empty() {
+            self.has_pending.store(false, Ordering::Release);
+        }
         if !pending.is_empty() || self.card.is_some() {
             return;
         }
@@ -3507,7 +3617,7 @@ impl Shadow {
     /// The copy's bytes at offsets `[from, to)` change: a kept snapshot is
     /// not current there any more.
     fn changed(&self, from: usize, to: usize) {
-        if !keeps() || from >= to {
+        if self.card.is_some() || !keeps() || from >= to {
             return;
         }
         let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
@@ -3522,13 +3632,15 @@ impl Shadow {
     /// Whether shaders of a submission not yet copied back may be writing
     /// the copy.
     pub(crate) fn writes_pending(&self) -> bool {
-        !self.pending.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+        self.has_pending.load(Ordering::Acquire)
+            && !self.pending.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
     }
 
     /// Whether one of those submissions may be writing in title memory
     /// `[from, to)`.
     pub(crate) fn writes_pending_in(&self, from: usize, to: usize) -> bool {
-        self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from)
+        self.has_pending.load(Ordering::Acquire)
+            && self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from)
     }
 
     /// Whether [`Shadow::update`] of `[address, address + len)` would leave
@@ -3785,32 +3897,39 @@ impl Shadow {
         if from >= to {
             return 0;
         }
-        let mut busy: Vec<(usize, usize)> = self
-            .pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .copied()
-            .filter(|&(a, e)| a < to && e > from)
-            .collect();
-        if !busy.is_empty() {
-            // Around ranges shaders are writing: the gaps, each as below
-            // (in the world most submissions have such ranges; copying the
-            // gaps whole cost ~1 s per frame).
-            busy.sort_unstable();
-            let (mut at, mut bytes) = (from, 0);
-            for (a, e) in busy {
-                if a > at {
-                    bytes += self.update_free(at, a);
+        if self.has_pending.load(Ordering::Acquire) {
+            let mut busy: Vec<(usize, usize)> = self
+                .pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .copied()
+                .filter(|&(a, e)| a < to && e > from)
+                .collect();
+            if !busy.is_empty() {
+                // Around ranges shaders are writing: the gaps, each as below
+                // (in the world most submissions have such ranges; copying the
+                // gaps whole cost ~1 s per frame).
+                busy.sort_unstable();
+                let (mut at, mut bytes) = (from, 0);
+                for (a, e) in busy {
+                    if a > at {
+                        bytes += self.update_free(at, a);
+                    }
+                    at = at.max(e);
                 }
-                at = at.max(e);
+                if at < to {
+                    bytes += self.update_free(at, to);
+                }
+                let kind = if self.card.is_some() { 0 } else if self.mapped { 1 } else { 2 };
+                COPY_KIND_BYTES[kind].fetch_add(bytes as u64, Ordering::Relaxed);
+                return bytes;
             }
-            if at < to {
-                bytes += self.update_free(at, to);
-            }
-            return bytes;
         }
-        self.update_free(from, to)
+        let bytes = self.update_free(from, to);
+        let kind = if self.card.is_some() { 0 } else if self.mapped { 1 } else { 2 };
+        COPY_KIND_BYTES[kind].fetch_add(bytes as u64, Ordering::Relaxed);
+        bytes
     }
 
     /// Whether [`Shadow::update`] of `[address, address + len)` would copy
@@ -3829,7 +3948,9 @@ impl Shadow {
             return false;
         }
         // Around ranges shaders are writing the refresh asks gap by gap.
-        if self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from) {
+        if self.has_pending.load(Ordering::Acquire)
+            && self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from)
+        {
             return false;
         }
         let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
@@ -4144,7 +4265,7 @@ impl Shadow {
                 // refresh lie apart.
                 let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at - start), n) };
                 let was = crate::host::upcheck::on().then(|| held.to_vec());
-                let runs = if whole { vec![(0, n)] } else { dword_runs(at, held, title, 0) };
+                let runs = if whole { vec![(0, n)] } else { word_runs(at, held, title) };
                 for &(a, len) in &runs {
                     held[a..a + len].copy_from_slice(&title[a..a + len]);
                     self.changed(at - start + a, at - start + a + len);
@@ -4789,6 +4910,7 @@ mod land_tests {
             return; // no host GPU
         };
         shadow.pending.lock().unwrap().push((title, title + LEN));
+        shadow.has_pending.store(true, Ordering::Release);
         // SAFETY: committed, aligned; touched as atomics or by the landing's
         // stores of whole dwords.
         let dword = |i: usize| unsafe { &*((title + i * 4) as *const AtomicU32) };

@@ -1,0 +1,30 @@
+[workspace]
+
+[package]
+name = "cuda-accel"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "GPL-3.0-or-later"
+publish = false
+description = "Optional NVIDIA CUDA / cuda-oxide SIMT offload kernels and zero-copy DX12 NT shared-handle interop."
+
+[dependencies]
+victory-formats = { path = "../victory-formats" }
+thiserror = "2.0.21"
+tracing = "0.1.44"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_System_LibraryLoader",
+] }
+
+[dev-dependencies]
+criterion = { version = "0.5.1", default-features = false, features = ["cargo_bench_support"] }
+lz4_flex = { version = "0.11.3", default-features = false, features = ["std", "frame"] }
+zlib-rs = { version = "0.6.8", default-features = false, features = ["std"] }
+
+[[bench]]
+name = "cuda_kernels"
+harness = false

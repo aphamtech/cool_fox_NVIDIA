@@ -229,19 +229,58 @@ pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, us
     }
     let one = |i: usize| {
         let (from, ranges, to) = work[i];
-        let mut to = to as *mut [u32; 2];
+        // Stage pairs into an L1-resident 64-byte buffer and flush with
+        // non-temporal stores when 32-byte aligned so write-combined GPU upload
+        // memory never evicts L2/L3 cache lines.
+        #[repr(align(32))]
+        struct Stage([u32; 16]);
+        let mut stage = Stage([0u32; 16]);
+        let mut filled = 0usize;
+        let mut dst = to as *mut [u32; 2];
+        let flush = |dst: &mut *mut [u32; 2], buf: &[u32; 16], pairs: usize| {
+            if pairs == 0 {
+                return;
+            }
+            let bytes = pairs * 8;
+            // SAFETY: inside `memory` which has room for every pair.
+            unsafe {
+                #[cfg(target_arch = "x86_64")]
+                if pairs == 8
+                    && (*dst).addr().is_multiple_of(32)
+                    && std::arch::is_x86_feature_detected!("avx2")
+                {
+                    use std::arch::x86_64::*;
+                    let v0 = _mm256_load_si256(buf.as_ptr().cast::<__m256i>());
+                    let v1 = _mm256_load_si256(buf.as_ptr().add(8).cast::<__m256i>());
+                    _mm256_stream_si256((*dst).cast::<__m256i>(), v0);
+                    _mm256_stream_si256((*dst).add(4).cast::<__m256i>(), v1);
+                    *dst = (*dst).add(8);
+                    return;
+                }
+                std::ptr::copy_nonoverlapping(buf.as_ptr().cast::<u8>(), (*dst).cast::<u8>(), bytes);
+                *dst = (*dst).add(pairs);
+            }
+        };
         for &(a, b) in ranges.iter().filter(|r| short(r)) {
             for offset in (a..b).step_by(4) {
                 // SAFETY: inside the copy's mapping (its CPU side, which
                 // the thread that asked, and waits, alone writes in these
-                // ranges) and inside the memory, which has room for every
-                // pair, a piece of work's behind the last one's.
-                unsafe {
-                    let word = ((from + offset) as *const u32).read_unaligned();
-                    to.write([offset as u32, word]);
-                    to = to.add(1);
+                // ranges).
+                let word = unsafe { ((from + offset) as *const u32).read_unaligned() };
+                stage.0[filled * 2] = offset as u32;
+                stage.0[filled * 2 + 1] = word;
+                filled += 1;
+                if filled == 8 {
+                    flush(&mut dst, &stage.0, 8);
+                    filled = 0;
                 }
             }
+        }
+        flush(&mut dst, &stage.0, filled);
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: sfence orders non-temporal WC stores before GPU submission.
+        unsafe {
+            std::arch::x86_64::_mm_sfence();
         }
     };
     crate::land::each_under(work.len(), &one);

@@ -2,7 +2,9 @@
 resolver = "3"
 members = ["crates/*", "apps/*", "xtask"]
 # Fixtures are standalone crates built on demand by integration tests.
-exclude = ["tests/fixtures"]
+# `crates/cuda_accel/kernels_oxide` pins the cuda-oxide compiler toolchain (Rust 1.99.1 + rustc-dev)
+# separately so standard workspace builds work cleanly without `cargo-oxide`.
+exclude = ["tests/fixtures", "crates/cuda_accel", "crates/cuda_accel/kernels_oxide"]
 
 [workspace.package]
 version = "0.1.0"
@@ -22,6 +24,7 @@ victory-shader = { path = "crates/victory-shader" }
 victory-formats = { path = "crates/victory-formats" }
 victory-pipeline = { path = "crates/victory-pipeline" }
 victory-game = { path = "crates/victory-game" }
+cuda-accel = { path = "crates/cuda_accel" }
 
 # External crates
 anyhow = "1.0.104"
@@ -79,6 +82,8 @@ opt-level = 2
 
 [profile.release]
 debug = "line-tables-only"
+lto = "thin"
+codegen-units = 16
 
 # The development build: release code generation plus the `diagnostics`
 # feature (`cargo build --profile diag -p victory --features diagnostics`),

@@ -38,8 +38,8 @@ LOGS_DIR = REPO_ROOT / "logs"
 FRAMETIMES_CSV = LOGS_DIR / "frametimes.csv"
 RUN_LOG = LOGS_DIR / "run.log"
 DEFAULT_GAME_DIR = Path(r"K:\GAME OFFLINE\Rockstar\GTA VI\GTA6.Xbox.v1.0.2.1-CYBERLEEK")
-HARD_TIMEOUT_SEC = 180.0
-SCENE_LOAD_WAIT_SEC = 120.0
+HARD_TIMEOUT_SEC = 140.0
+SCENE_LOAD_WAIT_SEC = 60.0
 MEASURE_WINDOW_SEC = 20.0
 
 
@@ -395,7 +395,7 @@ def make_launch_env(game_dir: Path) -> dict:
     env["VICTORY_FRAMETIMES"] = str(FRAMETIMES_CSV)
     # Also schedule Enter through victory-hle's GameInput bridge so menu skip
     # works reliably even if Windows UIPI blocks SendInput or focus shifts.
-    env.setdefault("VICTORY_KEYS", "8:Enter,14:Enter,20:Enter,26:Enter,32:Enter")
+    env.setdefault("VICTORY_KEYS", "8:Enter,14:Enter,20:Enter")
     return env
 
 
@@ -456,7 +456,7 @@ def main() -> int:
         "--extra-enter-at",
         type=float,
         nargs="*",
-        default=[6.0, 12.0, 18.0, 24.0],
+        default=[6.0, 12.0],
         help="Extra Enter presses at given seconds into the scene load wait to pass splash/menu screens.",
     )
     args = parser.parse_args()

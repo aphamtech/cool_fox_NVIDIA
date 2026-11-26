@@ -15,8 +15,8 @@ const MAX_FILE_SIZE: usize = 640 * 1024;
 const MAX_ENCODED_RUN: usize = 512;
 
 const ALLOWED_EXTENSIONS: &[&str] = &[
-    "rs", "toml", "md", "txt", "lock", "yml", "yaml", "json", "hlsl", "hlsli", "ps1", "cmd", "sh",
-    "bat", "py",
+    "rs", "toml", "md", "txt", "lock", "yml", "yaml", "json", "hlsl", "hlsli", "cu", "ps1", "cmd",
+    "sh", "bat", "py",
 ];
 const ALLOWED_NAMES: &[&str] = &[
     ".gitignore",

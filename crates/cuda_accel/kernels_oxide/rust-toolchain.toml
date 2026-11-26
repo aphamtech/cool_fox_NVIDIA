@@ -1,0 +1,7 @@
+# Pinned Rust compiler toolchain for compiling pure-Rust `cuda-oxide` kernels
+# via `cargo oxide build --release` (NVIDIA/cuda-rust).
+# Isolated in `crates/cuda_accel/kernels_oxide/` (excluded from root workspace)
+# so standard `cargo build --release` stays on the default stable toolchain.
+[toolchain]
+channel = "1.99.1"
+components = ["rustc-dev", "llvm-tools", "rust-src"]

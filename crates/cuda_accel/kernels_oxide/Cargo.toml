@@ -1,0 +1,22 @@
+[workspace]
+
+[package]
+name = "victory-kernels-oxide"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+description = "Pure-Rust NVIDIA cuda-oxide SIMT kernels for Victory (compiled with `cargo oxide`)."
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# When building with `cargo oxide`, point these to the NVIDIA/cuda-rust release or local checkout:
+# cuda-std = { git = "https://github.com/NVIDIA/cuda-rust", package = "cuda-std" }
+# cuda-oxide = { git = "https://github.com/NVIDIA/cuda-rust", package = "cuda-oxide" }
+
+[features]
+default = []
+# Enable when compiling under `cargo oxide build --release --target nvptx64-nvidia-cuda`.
+cuda-device = []

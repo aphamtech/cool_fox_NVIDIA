@@ -59,6 +59,7 @@ pub fn velocity_error_to_hresult(err: &VelocityIoError) -> i32 {
         VelocityIoError::DecompressionFailed { .. } => HRESULT_INVALID_DATA,
         VelocityIoError::ProprietaryCodecStub { .. } => E_NOTIMPL,
         VelocityIoError::ComputeQueue { hresult, .. } => *hresult,
+        VelocityIoError::ComputeDispatchFailed(_) => E_FAIL,
         VelocityIoError::IoFailure { os_code, .. } => match os_code {
             Some(code) if *code < 0 => *code,
             Some(code) => (0x8007_0000u32 | ((*code as u32) & 0xFFFF)) as i32,

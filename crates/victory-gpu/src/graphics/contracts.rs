@@ -200,6 +200,8 @@ pub enum VelocityIoError {
     },
     #[error("async compute queue error ({hresult:#010x}): {context}")]
     ComputeQueue { hresult: i32, context: &'static str },
+    #[error("external GPU compute error: {0}")]
+    ComputeDispatchFailed(String),
     #[error("queue closed")]
     QueueClosed,
 }
@@ -651,4 +653,160 @@ pub trait DecompressionBackend: Send + Sync {
         job: &DecompressionJob<'_>,
         compute: &dyn ComputeQueueBackend,
     ) -> Result<DecompressionOutput, VelocityIoError>;
+}
+
+// ---------------------------------------------------------------------------
+// Subsystem C (`cuda-oxide` / external GPU compute offload) contracts
+// ---------------------------------------------------------------------------
+
+/// Opaque handle to a zero-copy GPU buffer shared between DX12 (`D3D12_HEAP_FLAG_SHARED`)
+/// and an external compute runtime (`cuImportExternalMemory` via Win32 NT handle).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SharedBufferHandle {
+    pub id: u64,
+    pub byte_len: u64,
+}
+
+/// Opaque handle to a zero-copy timeline fence shared between DX12 (`D3D12_FENCE_FLAG_SHARED`)
+/// and an external compute runtime (`cuImportExternalSemaphore` via Win32 NT handle).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SharedFenceHandle {
+    pub id: u64,
+}
+
+/// C-ABI descriptor for one Xbox RDNA2 micro-tiled subresource detile dispatch.
+///
+/// Matches `victory_formats::texture::Layout::offset` byte-for-byte.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DetileDispatchDesc {
+    /// Byte offset of this texture's slice base + mip offset inside the source tiled buffer.
+    pub src_base_offset: u64,
+    /// Byte offset of the destination linear subresource inside the shared VRAM staging buffer.
+    pub dst_base_offset: u64,
+    /// Subresource width in elements (texels or 4x4 BC blocks).
+    pub width_elements: u32,
+    /// Subresource height in elements.
+    pub height_elements: u32,
+    /// Depth slices to detile (`1` for 2D array slice, `mip.depth` for 3D).
+    pub depth_slices: u32,
+    /// Bytes per element (`1`, `2`, `4`, `8`, or `16`).
+    pub element_bytes: u32,
+    /// Block dimensions `[bw, bh, bd]` in elements.
+    pub block_dims: [u32; 3],
+    /// `log2(block_bytes)` (`8`, `12`, or `16`, or `0` for linear).
+    pub block_log2: u32,
+    /// Padded mip pitch in elements (`mip.pitch`).
+    pub mip_pitch_elements: u32,
+    /// Destination row pitch in bytes (`D3D12_SUBRESOURCE_FOOTPRINT::RowPitch`).
+    pub dst_row_pitch_bytes: u32,
+    /// Destination depth slice pitch in bytes.
+    pub dst_depth_pitch_bytes: u32,
+    /// Mip-tail coordinate shift `(tail.x, tail.y)` in elements (`0, 0` outside tail).
+    pub tail_x: u32,
+    pub tail_y: u32,
+    /// Index (`0..45`) into the pre-uploaded GFX10 RB+ swizzle LUT table, or `u32::MAX` for linear.
+    pub pattern_id: u32,
+    /// Non-zero for thick 3D blocks (`Layout::thick`), with slab byte stride in `slice_size`.
+    pub thick: u32,
+    /// `Layout::slice_size` (bytes per depth slab for thick 3D, or per depth slice for thin 3D).
+    pub slice_size: u64,
+    /// Starting slice index (`slice` for 2D array, `0` for 3D).
+    pub first_slice: u32,
+    pub _pad: u32,
+}
+
+/// C-ABI descriptor for one independent LZ4 or GDeflate v1 tile/block inside a batch.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecompressBlockDesc {
+    pub src_offset: u64,
+    pub src_len: u32,
+    pub dst_len: u32,
+    pub dst_offset: u64,
+}
+
+/// C-ABI descriptor for one 64 KiB piece checked by sparse readback delta compaction.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadbackPieceDesc {
+    /// Byte offset inside the GPU card buffer (`now`).
+    pub now_offset: u64,
+    /// Byte offset inside the reference snapshot buffer (`held`).
+    pub held_offset: u64,
+    /// Number of 32-bit dwords in this piece (`<= 16384`).
+    pub dword_count: u32,
+    /// Caller piece index echoed into emitted [`ReadbackDeltaPair`] records.
+    pub piece_id: u32,
+}
+
+/// Compacted changed dword emitted by GPU sparse readback delta compaction.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ReadbackDeltaPair {
+    pub piece_id: u32,
+    pub dword_offset: u32,
+    pub value: u32,
+}
+
+/// Feature-gated (`--features cuda-oxide`) zero-copy external GPU compute backend.
+///
+/// Keeps all CUDA driver / `cuda-oxide` FFI completely isolated in `crates/cuda_accel/`
+/// so default builds and non-CUDA hosts compile and execute with native CPU/DX12 fallbacks.
+pub trait GpuComputeBackend: Send + Sync {
+    fn backend_name(&self) -> &'static str;
+
+    /// Imports a DX12-shared VRAM resource (`D3D12_HEAP_FLAG_SHARED`) via its Win32 NT handle.
+    fn import_shared_buffer(
+        &self,
+        nt_handle: usize,
+        byte_len: u64,
+        dedicated: bool,
+    ) -> Result<SharedBufferHandle, VelocityIoError>;
+
+    fn release_shared_buffer(&self, handle: SharedBufferHandle);
+
+    /// Imports a DX12-shared timeline fence (`D3D12_FENCE_FLAG_SHARED`) via its Win32 NT handle.
+    fn import_shared_fence(&self, nt_handle: usize) -> Result<SharedFenceHandle, VelocityIoError>;
+
+    fn release_shared_fence(&self, handle: SharedFenceHandle);
+
+    /// Asynchronously uploads host tiled bytes and detiles a batch of RDNA2 subresources directly
+    /// into a DX12-shared VRAM linear staging buffer, signaling `signal_fence` to `signal_value`.
+    fn enqueue_detile_batch(
+        &self,
+        host_tiled_bytes: &[u8],
+        dst_linear_vram: SharedBufferHandle,
+        dispatches: &[DetileDispatchDesc],
+        wait: Option<(SharedFenceHandle, u64)>,
+        signal: Option<(SharedFenceHandle, u64)>,
+    ) -> Result<(), VelocityIoError>;
+
+    /// Asynchronously decompresses a batch of LZ4 raw blocks or GDeflate v1 tiles directly
+    /// into a DX12-shared VRAM buffer, signaling `signal` upon completion.
+    fn enqueue_decompress_batch(
+        &self,
+        codec: DecompressionCodec,
+        host_compressed_bytes: &[u8],
+        dst_uncompressed_vram: SharedBufferHandle,
+        blocks: &[DecompressBlockDesc],
+        wait: Option<(SharedFenceHandle, u64)>,
+        signal: Option<(SharedFenceHandle, u64)>,
+    ) -> Result<(), VelocityIoError>;
+
+    /// Compacts changed dwords across `pieces` comparing `now_vram` against `held_vram`,
+    /// writing dense [`ReadbackDeltaPair`] entries into `out_pairs` and returning the pair count
+    /// (or `None` if deltas exceeded `out_pairs.len()` and caller should fall back to full copy).
+    fn compact_readback_deltas(
+        &self,
+        now_vram: SharedBufferHandle,
+        held_vram: SharedBufferHandle,
+        pieces: &[ReadbackPieceDesc],
+        out_pairs: &mut [ReadbackDeltaPair],
+        wait: Option<(SharedFenceHandle, u64)>,
+    ) -> Result<Option<usize>, VelocityIoError>;
+
+    /// Synchronizes the external compute stream (used only by async worker threads / tests,
+    /// never on the render/submit thread).
+    fn synchronize(&self) -> Result<(), VelocityIoError>;
 }

@@ -640,6 +640,11 @@ pub(crate) fn log_removal_context() {
     }
 }
 
+/// Lightweight per-stage submit timers in microseconds:
+/// `[card_steps, ask_once, refresh_front, deferred, prelude, card_before, heaps_wait, exec]`.
+static SUBMIT_STAGES: [std::sync::atomic::AtomicU64; 8] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+
 /// Time spent in submissions since the last frame-rate line, in
 /// microseconds: preparing them on the CPU (title memory copies, texture
 /// detiling), then waiting for the GPU.
@@ -5724,7 +5729,12 @@ impl Host {
         // settles them first, one sent ahead only if preparing it reads
         // what they write.
         // Or the reads are done on the card, behind the flights.
+        // Per-stage submit timers (microseconds) for release profiling:
+        // [0]=card_steps, [1]=ask_once, [2]=refresh_front, [3]=run_deferred+fill+flush,
+        // [4]=prelude, [5]=card_before, [6]=heaps_wait+make_waiting, [7]=exec+signal.
+        let t_cs = std::time::Instant::now();
         let own = if late { self.card_steps(runs) } else { None };
+        SUBMIT_STAGES[0].fetch_add(t_cs.elapsed().as_micros() as u64, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         ahead.part(12);
         stage.next("submit: waiting for flights it reads from");
@@ -5820,7 +5830,9 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             SPLIT[8].fetch_add(split.so_far(), Ordering::Relaxed);
             stage.next("submit: asking the write watch");
+            let t_ask = std::time::Instant::now();
             crate::watch::ask_once(&ranges);
+            SUBMIT_STAGES[1].fetch_add(t_ask.elapsed().as_micros() as u64, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             split.part(0);
             stage.next("submit: title bytes under flights' writes");
@@ -5850,24 +5862,32 @@ impl Host {
         // What flights in the air may write.
         let air = line().written.clone();
         stage.next("submit: refreshes ahead of writes");
+        let t_ref = std::time::Instant::now();
         if refresh_front() {
             batch.refresh_front(runs, &parts);
         } else if ahead_of_writes() {
             batch.refresh_ahead(runs, |list, i| own.as_ref().is_some_and(|own| own.takes(list, i)));
         }
+        SUBMIT_STAGES[2].fetch_add(t_ref.elapsed().as_micros() as u64, Ordering::Relaxed);
         stage.next("submit: the lists' steps");
+        let t_def = std::time::Instant::now();
+        let mut prelude_us = 0u64;
         for list in runs {
             list.run_deferred(&mut batch, &air, |i| own.as_ref().is_some_and(|own| own.takes(list, i)));
             firsts.push(lists.len());
+            let t_pre = std::time::Instant::now();
             if let Some(prelude) = list.prelude() {
                 lists.push(Some(prelude));
             }
+            prelude_us += t_pre.elapsed().as_micros() as u64;
             lists.push(list.list.cast().ok());
         }
         batch.fill();
         stage.next("submit: the last refreshes");
         batch.flush();
         crate::watch::ask_once_end();
+        SUBMIT_STAGES[3].fetch_add(t_def.elapsed().as_micros() as u64 - prelude_us, Ordering::Relaxed);
+        SUBMIT_STAGES[4].fetch_add(prelude_us, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         split.part(2);
         stage.next("submit: snapshots");
@@ -5900,7 +5920,9 @@ impl Host {
             shadow.writing(*at, *len);
         }
         let declared = declared_writes(runs);
+        let t_cb = std::time::Instant::now();
         let card = self.card_before(&declared, &picked, flown);
+        SUBMIT_STAGES[5].fetch_add(t_cb.elapsed().as_micros() as u64, Ordering::Relaxed);
         // The sends are taken: from here on the references hold what the
         // copies in the lists put.
         for (shadow, at, bytes) in batch.placed.drain(..) {
@@ -5912,10 +5934,12 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         split.part(4);
         stage.next("submit: waiting for the heaps' records");
+        let t_hp = std::time::Instant::now();
         drop(heaps_synced);
         // The slots that waited for a texture's host copy, before the
         // lists that may read them run.
         crate::descriptor::make_waiting();
+        SUBMIT_STAGES[6].fetch_add(t_hp.elapsed().as_micros() as u64, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         split.part(15);
         let prepared = std::time::Instant::now();
@@ -5940,6 +5964,7 @@ impl Host {
                 firsts.iter_mut().for_each(|first| *first += 1);
             }
             let cuts: Vec<usize> = parts.iter().filter_map(|&n| firsts.get(n).copied()).collect();
+            let t_ex = std::time::Instant::now();
             // SAFETY: closed lists; the fence is ours.
             let signalled = unsafe {
                 let mut from = 0;
@@ -5949,6 +5974,7 @@ impl Host {
                 }
                 self.queue.Signal(&self.fence, *submitted)
             };
+            SUBMIT_STAGES[7].fetch_add(t_ex.elapsed().as_micros() as u64, Ordering::Relaxed);
             awake::sent(&self.device);
             #[cfg(feature = "diagnostics")]
             crate::timeline::sent(sending, *submitted, stamp);
@@ -7671,8 +7697,7 @@ impl HostList {
                     {
                         copies += 1;
                     }
-                    batch.fill();
-                    batch.title_written();
+                    batch.title_written_range(dst, len);
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     // With the submission's one asking: the journal learns it.
                     crate::watch::wrote(dst, len);
@@ -7700,9 +7725,8 @@ impl HostList {
                 Step::Placed(p) => {
                     let started = std::time::Instant::now();
                     let free = !touches(air, p.src, p.src + p.len) && !touches(air, p.dst, p.dst + p.len);
-                    batch.fill();
                     if free {
-                        batch.title_written();
+                        batch.title_written_range(p.dst, p.len);
                     }
                     if let Some(bytes) = p.prepare(free) {
                         batch.placed.push((p.shadow.clone(), p.dst, bytes));
@@ -7757,7 +7781,7 @@ impl HostList {
                     continue;
                 }
                 Step::Texture(staging) => {
-                    if batch.texture_due(staging) {
+                    if batch.texture_due_range(staging) {
                         batch.due.push(staging.clone());
                         if !wide_textures() {
                             batch.refresh_textures();
@@ -8003,8 +8027,9 @@ struct Batch {
     /// comparisons a frame.
     index: ByCopy<usize>,
     /// Staging buffers (by address) refreshed since the last title write,
-    /// or due to be.
-    textures: std::collections::HashSet<usize>,
+    /// or due to be, with their `(mem_start, mem_end)` range for fine-grained
+    /// invalidation on ranged title writes (`Step::Placed` / `Step::Copy`).
+    textures: ByCopy<(usize, usize)>,
     /// Those due ([`Batch::refresh_textures`]).
     due: Vec<std::sync::Arc<crate::texture::Staging>>,
     /// What copies at their place in the submission's lists put into title
@@ -8300,17 +8325,80 @@ impl Batch {
     }
 
     /// Whether `staging` is still to be refreshed in this submission (and
-    /// notes it refreshed).
+    /// notes it refreshed, without memory range — used by generic tests).
+    #[cfg(test)]
     fn texture_due<T>(&mut self, staging: &std::sync::Arc<T>) -> bool {
-        self.textures.insert(std::sync::Arc::as_ptr(staging) as *const () as usize)
+        let key = std::sync::Arc::as_ptr(staging) as *const () as usize;
+        if self.textures.contains_key(&key) {
+            return false;
+        }
+        self.textures.insert(key, (0, usize::MAX));
+        true
     }
 
-    /// Before a step that writes title memory: pending refreshes are done
-    /// first, and textures are checked again after it.
+    /// Whether `staging` is still to be refreshed in this submission (and
+    /// notes it refreshed along with its title-memory range for fine-grained
+    /// invalidation on ranged title writes).
+    fn texture_due_range(&mut self, staging: &std::sync::Arc<crate::texture::Staging>) -> bool {
+        let key = std::sync::Arc::as_ptr(staging) as usize;
+        if self.textures.contains_key(&key) {
+            return false;
+        }
+        let (at, len) = staging.memory();
+        self.textures.insert(key, (at, at.saturating_add(len)));
+        true
+    }
+
+    /// Before a step that writes title memory at an unknown address: pending
+    /// refreshes are done first, and textures are checked again after it.
     fn title_written(&mut self) {
         self.flush();
         self.ahead.clear();
         self.textures.clear();
+    }
+
+    /// Before a step that writes a known title memory range `[dst, dst + len)`
+    /// (`Step::Placed` / `Step::Copy`): flush only pending fills, refreshes,
+    /// and textures that actually overlap `[dst, dst + len)` instead of wiping
+    /// `self.ahead` and `self.textures` for all 3,400+ buffers.
+    fn title_written_range(&mut self, dst: usize, len: usize) {
+        let end = dst.saturating_add(len);
+        if dst >= end {
+            return;
+        }
+        // Flush pending fills only if any fill reads from the range being overwritten.
+        if self.fills.iter().any(|&(_, src, flen)| src < end && dst < src.saturating_add(flen)) {
+            self.fill();
+        }
+        // Flush any due textures whose title memory overlaps `[dst, end)`.
+        if self.due.iter().any(|s| {
+            let (at, tlen) = s.memory();
+            at < end && dst < at.saturating_add(tlen)
+        }) {
+            self.refresh_textures();
+        }
+        // Flush only pending buffer refreshes whose range overlaps `[dst, end)`.
+        if self.refreshes.iter().any(|&(_, from, to)| from < end && dst < to) {
+            let mut i = 0;
+            while i < self.refreshes.len() {
+                let (_, from, to) = self.refreshes[i];
+                if from < end && dst < to {
+                    let (shadow, from, to) = self.refreshes.swap_remove(i);
+                    self.index.remove(&(std::sync::Arc::as_ptr(&shadow) as usize));
+                    if let Some(moved) = self.refreshes.get(i) {
+                        self.index.insert(std::sync::Arc::as_ptr(&moved.0) as usize, i);
+                    }
+                    if !(crate::watch::light() && shadow.nothing_new(from, to - from)) {
+                        Self::update(&shadow, from, to);
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+        }
+        // Invalidate only `ahead` spans and `textures` overlapping `[dst, end)`.
+        self.ahead.retain(|_, &mut (from, to)| !(from < end && dst < to));
+        self.textures.retain(|_, &mut (from, to)| !(from < end && dst < to));
     }
 
     /// Before the steps of `runs` ([`refresh_front`]), a new part of the
@@ -8336,7 +8424,7 @@ impl Batch {
                     }
                     Step::GpuWrite(shadow, ..) => touches.push(Touch::Write(std::sync::Arc::as_ptr(shadow) as usize)),
                     Step::Texture(staging) if wide_textures() => {
-                        if self.texture_due(staging) {
+                        if self.texture_due_range(staging) {
                             due.push(staging.clone());
                         }
                     }
@@ -8371,6 +8459,11 @@ impl Batch {
             spans.retain(|(shadow, from, to)| !shadow.nothing_new(*from, *to - *from));
             #[cfg(feature = "diagnostics")]
             FLUSHES[2].fetch_add((all - spans.len()) as u64, Ordering::Relaxed);
+        }
+        // Schedule largest buffer spans first so huge heap copies don't become
+        // single-thread stragglers at the end of `wide_each`.
+        if spans.len() > 2 {
+            spans.sort_unstable_by(|a, b| (b.2 - b.1).cmp(&(a.2 - a.1)));
         }
         let ahead = spans.len() > 1;
         if ahead {
@@ -9230,6 +9323,13 @@ impl Meter {
         let drops = crate::pipeline::take_drops();
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
             self.logged = std::time::Instant::now();
+            let [cs, ask, refr, def, pre, cb, hp, ex] =
+                [0, 1, 2, 3, 4, 5, 6, 7].map(|i| SUBMIT_STAGES[i].swap(0, Ordering::Relaxed) as f64 / 1e3 / frames);
+            let [card_mb, rebar_mb, shared_mb] =
+                crate::shadow::copy_kind_bytes().map(|b| b as f64 / (1024.0 * 1024.0) / frames);
+            tracing::info!(
+                "submit stages/frame: card_steps={cs:.2}ms ask={ask:.2}ms refresh={refr:.2}ms deferred={def:.2}ms prelude={pre:.2}ms card_before={cb:.2}ms heaps={hp:.2}ms exec={ex:.2}ms | shadow refresh MB: card={card_mb:.1} rebar={rebar_mb:.1} shared={shared_mb:.1}"
+            );
             tracing::info!(
                 "placed texture views: {} writes of another view of the texture a slot showed (it kept the old view until the new was made)",
                 crate::descriptor::host::KEPT_VIEWS.load(Ordering::Relaxed)

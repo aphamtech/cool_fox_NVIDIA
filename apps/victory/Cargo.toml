@@ -37,6 +37,8 @@ diagnostics = [
     "victory-loader/diagnostics",
     "victory-shader/diagnostics",
 ]
+# Optional NVIDIA CUDA / cuda-oxide GPU compute offload.
+cuda-oxide = ["victory-hle/cuda-oxide"]
 
 [lints]
 workspace = true

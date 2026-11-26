@@ -231,11 +231,59 @@ fn workers() -> Option<&'static ID3D12CommandQueue> {
         .map(|q| &q.0)
 }
 
+#[cfg(feature = "cuda-oxide")]
+struct CudaWorkerState {
+    bridge: Arc<crate::graphics::cuda_bridge::CudaOxideBridge>,
+    vram_buf: crate::graphics::cuda_bridge::SharedVramBuffer,
+    fence: crate::graphics::cuda_bridge::SharedTimelineFence,
+    host_tiled_scratch: Vec<u8>,
+    dispatches: Vec<crate::graphics::contracts::DetileDispatchDesc>,
+    placements: Vec<Option<u64>>,
+}
+
+#[cfg(feature = "cuda-oxide")]
+impl CudaWorkerState {
+    /// 40 MiB linear VRAM staging buffer per worker (exceeds `NVIDIA_BATCH` 32 MiB plus
+    /// D3D12 512-byte footprint alignment padding).
+    const VRAM_STAGING_BYTES: u64 = 40 << 20;
+
+    fn try_new(device: &ID3D12Device) -> Option<Self> {
+        let bridge = crate::graphics::cuda_bridge::global_bridge()?;
+        let vram_buf = match bridge.create_shared_vram_buffer(device, Self::VRAM_STAGING_BYTES) {
+            Ok(b) => b,
+            Err(err) => {
+                tracing::warn!(error = %err, "cuda-oxide shared VRAM staging buffer unavailable; using CPU detile");
+                return None;
+            }
+        };
+        let fence = match bridge.create_shared_timeline_fence(device) {
+            Ok(f) => f,
+            Err(err) => {
+                tracing::warn!(error = %err, "cuda-oxide shared timeline fence unavailable; using CPU detile");
+                return None;
+            }
+        };
+        Some(Self {
+            bridge,
+            vram_buf,
+            fence,
+            host_tiled_scratch: Vec::with_capacity(4 << 20),
+            dispatches: Vec::with_capacity(256),
+            placements: Vec::with_capacity(128),
+        })
+    }
+}
+
+#[cfg(feature = "cuda-oxide")]
+static CUDA_DETILE_STATS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
 struct Worker {
     queue: ID3D12CommandQueue,
     allocator: ID3D12CommandAllocator,
     list: ID3D12GraphicsCommandList,
     fence: ID3D12Fence,
+    #[cfg(feature = "cuda-oxide")]
+    cuda: Option<CudaWorkerState>,
 }
 
 // SAFETY: a worker's objects are its thread's own; the queue is free-threaded.
@@ -243,17 +291,26 @@ unsafe impl Send for Worker {}
 
 impl Worker {
     fn new(device: &ID3D12Device, queue: ID3D12CommandQueue) -> windows::core::Result<Worker> {
+        #[cfg(feature = "cuda-oxide")]
+        let cuda = CudaWorkerState::try_new(device);
         // SAFETY: plain object creation.
         unsafe {
             let allocator: ID3D12CommandAllocator = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY)?;
             let list: ID3D12GraphicsCommandList =
                 device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, &allocator, None)?;
             list.Close()?;
-            Ok(Worker { queue, allocator, list, fence: device.CreateFence(0, D3D12_FENCE_FLAG_NONE)? })
+            Ok(Worker {
+                queue,
+                allocator,
+                list,
+                fence: device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?,
+                #[cfg(feature = "cuda-oxide")]
+                cuda,
+            })
         }
     }
 
-    fn work(self) {
+    fn work(mut self) {
         let mut value = 0;
         loop {
             let mut jobs = Vec::new();
@@ -279,19 +336,65 @@ impl Worker {
         }
     }
 
-    fn copy(&self, jobs: &[Arc<Job>], value: u64) -> windows::core::Result<()> {
-        for job in jobs {
-            job.staging.refresh();
+    fn copy(&mut self, jobs: &[Arc<Job>], value: u64) -> windows::core::Result<()> {
+        #[cfg(feature = "cuda-oxide")]
+        let cuda_wait: Option<u64> = self.prepare_cuda_batch(jobs);
+
+        #[cfg(feature = "cuda-oxide")]
+        {
+            for (idx, job) in jobs.iter().enumerate() {
+                let on_cuda = self
+                    .cuda
+                    .as_ref()
+                    .and_then(|c| c.placements.get(idx).copied().flatten())
+                    .is_some();
+                if !on_cuda {
+                    job.staging.refresh();
+                }
+            }
         }
+        #[cfg(not(feature = "cuda-oxide"))]
+        {
+            for job in jobs {
+                job.staging.refresh();
+            }
+        }
+
         // SAFETY: this worker's allocator and list, whose last submission has
         // run; the jobs hold what the list names until after the wait.
         unsafe {
             self.allocator.Reset()?;
             self.list.Reset(&self.allocator, None)?;
-            for job in jobs {
-                job.record(&self.list);
+            #[cfg(feature = "cuda-oxide")]
+            {
+                for (idx, job) in jobs.iter().enumerate() {
+                    if let Some((vram_res, vram_base)) = self.cuda.as_ref().and_then(|c| {
+                        c.placements
+                            .get(idx)
+                            .copied()
+                            .flatten()
+                            .map(|base| (c.vram_buf.d3d12_resource(), base))
+                    }) {
+                        job.record_from(&self.list, vram_res, vram_base);
+                    } else {
+                        job.record(&self.list);
+                    }
+                }
+            }
+            #[cfg(not(feature = "cuda-oxide"))]
+            {
+                for job in jobs {
+                    job.record(&self.list);
+                }
             }
             self.list.Close()?;
+
+            // GPU-side hardware timeline wait on CUDA's shared fence (zero CPU stall).
+            #[cfg(feature = "cuda-oxide")]
+            if let (Some(fence_val), Some(cuda)) = (cuda_wait, self.cuda.as_ref()) {
+                self.queue.Wait(cuda.fence.d3d12_fence(), fence_val)?;
+            }
+
             self.queue.ExecuteCommandLists(&[Some(self.list.cast()?)]);
             self.queue.Signal(&self.fence, value)?;
             // (Without an event: this waits.)
@@ -299,12 +402,223 @@ impl Worker {
         }
         Ok(())
     }
+
+    /// Gathers eligible RDNA2 textures in `jobs`, uploads their tiled bytes once, and launches
+    /// a single SM 8.9 CUDA detile kernel directly into the worker's DX12-shared VRAM buffer.
+    #[cfg(feature = "cuda-oxide")]
+    fn prepare_cuda_batch(&mut self, jobs: &[Arc<Job>]) -> Option<u64> {
+        use crate::graphics::contracts::{DetileDispatchDesc, GpuComputeBackend};
+
+        let cuda = self.cuda.as_mut()?;
+        cuda.host_tiled_scratch.clear();
+        cuda.dispatches.clear();
+        cuda.placements.clear();
+        cuda.placements.resize(jobs.len(), None);
+
+        let started = std::time::Instant::now();
+        let vram_cap = cuda.vram_buf.byte_len();
+        let mut vram_cursor = 0u64;
+        let mut cuda_textures = 0u64;
+        let mut cuda_bytes = 0u64;
+
+        for (idx, job) in jobs.iter().enumerate() {
+            let s = &job.staging;
+            if s.on_demand
+                || s.read == 0
+                || s.bytes == 0
+                || s.footprints.is_empty()
+                || !s.layout.addressable()
+            {
+                continue;
+            }
+            let vram_base = vram_cursor.next_multiple_of(512);
+            if vram_base.saturating_add(s.bytes) > vram_cap {
+                continue;
+            }
+
+            // Lock staging metadata and verify it still needs its initial detile.
+            let mut last = s.last.lock().unwrap_or_else(|e| e.into_inner());
+            let exact = s.exact.swap(false, Relaxed);
+            let alone = s.once.load(Relaxed);
+            if alone && !exact && last.hash.is_some() {
+                continue;
+            }
+
+            // Reserve 16-byte aligned slice inside the batch host tiled buffer.
+            let src_start = cuda.host_tiled_scratch.len().next_multiple_of(16);
+            let prev_len = cuda.host_tiled_scratch.len();
+            cuda.host_tiled_scratch.resize(src_start + s.read, 0);
+            let dst_slice = &mut cuda.host_tiled_scratch[src_start..src_start + s.read];
+
+            let read_ok = if super::no_wait() && !exact {
+                if let Some(_mapped) = crate::watch::title_memory_reading_now() {
+                    if super::committed(s.memory, s.read) {
+                        if super::through_copy() {
+                            crate::host::copy_mapped(dst_slice.as_mut_ptr(), s.memory, s.read, false);
+                        } else {
+                            // SAFETY: memory is committed and pinned by `_mapped`.
+                            let src = unsafe { std::slice::from_raw_parts(s.memory, s.read) };
+                            dst_slice.copy_from_slice(src);
+                        }
+                        true
+                    } else {
+                        crate::host::copy_mapped(dst_slice.as_mut_ptr(), s.memory, s.read, false);
+                        last.partial = Some(crate::frame::current());
+                        true
+                    }
+                } else {
+                    crate::host::read_into(s.memory, dst_slice)
+                }
+            } else {
+                let _mapped = crate::watch::title_memory_reading();
+                if super::committed(s.memory, s.read) {
+                    if super::through_copy() {
+                        crate::host::copy_mapped(dst_slice.as_mut_ptr(), s.memory, s.read, false);
+                    } else {
+                        // SAFETY: memory is committed and pinned by `_mapped`.
+                        let src = unsafe { std::slice::from_raw_parts(s.memory, s.read) };
+                        dst_slice.copy_from_slice(src);
+                    }
+                    true
+                } else {
+                    crate::host::copy_mapped(dst_slice.as_mut_ptr(), s.memory, s.read, false);
+                    last.partial = Some(crate::frame::current());
+                    true
+                }
+            };
+
+            if !read_ok {
+                cuda.host_tiled_scratch.truncate(prev_len);
+                continue;
+            }
+
+            let hash = super::digest(dst_slice);
+            if last.hash == Some(hash) {
+                // Content unchanged; no need to re-detile on CUDA.
+                cuda.host_tiled_scratch.truncate(prev_len);
+                continue;
+            }
+
+            // Build per-subresource CUDA detile descriptors matching `Layout::detile`.
+            let dispatches_before = cuda.dispatches.len();
+            let mut all_valid = true;
+            for (i, (footprint, &rows)) in s.footprints.iter().zip(&s.rows).enumerate() {
+                let (mip, slice) = s.part(i);
+                let pitch = footprint.Footprint.RowPitch;
+                let depth_pitch = pitch.saturating_mul(rows);
+                let Some(d) = cuda_accel::detile_desc_from_layout(
+                    &s.layout,
+                    mip,
+                    slice,
+                    src_start as u64,
+                    vram_base + footprint.Offset,
+                    pitch,
+                    depth_pitch,
+                ) else {
+                    all_valid = false;
+                    break;
+                };
+                cuda.dispatches.push(DetileDispatchDesc {
+                    src_base_offset: d.src_base_offset,
+                    dst_base_offset: d.dst_base_offset,
+                    width_elements: d.width_elements,
+                    height_elements: d.height_elements,
+                    depth_slices: d.depth_slices,
+                    element_bytes: d.element_bytes,
+                    block_dims: d.block_dims,
+                    block_log2: d.block_log2,
+                    mip_pitch_elements: d.mip_pitch_elements,
+                    dst_row_pitch_bytes: d.dst_row_pitch_bytes,
+                    dst_depth_pitch_bytes: d.dst_depth_pitch_bytes,
+                    tail_x: d.tail_x,
+                    tail_y: d.tail_y,
+                    pattern_id: d.pattern_id,
+                    thick: d.thick,
+                    slice_size: d.slice_size,
+                    first_slice: d.first_slice,
+                    _pad: d._pad,
+                });
+            }
+
+            if !all_valid {
+                cuda.dispatches.truncate(dispatches_before);
+                cuda.host_tiled_scratch.truncate(prev_len);
+                continue;
+            }
+
+            last.hash = Some(hash);
+            s.dirty.store(true, Relaxed);
+            cuda.placements[idx] = Some(vram_base);
+            vram_cursor = vram_base + s.bytes;
+            cuda_textures += 1;
+            cuda_bytes += s.read as u64;
+        }
+
+        if cuda.dispatches.is_empty() {
+            return None;
+        }
+
+        let fence_val = cuda.fence.next_signal_value();
+        match cuda.bridge.enqueue_detile_batch(
+            &cuda.host_tiled_scratch,
+            cuda.vram_buf.cuda_handle(),
+            &cuda.dispatches,
+            None,
+            Some((cuda.fence.cuda_handle(), fence_val)),
+        ) {
+            Ok(()) => {
+                let elapsed_us = started.elapsed().as_micros() as u64;
+                let preparing = &crate::host::PREPARING;
+                preparing[2].fetch_add(elapsed_us, Relaxed);
+                preparing[3].fetch_add(cuda_bytes, Relaxed);
+
+                let batches = CUDA_DETILE_STATS[0].fetch_add(1, Relaxed) + 1;
+                let tex_total = CUDA_DETILE_STATS[1].fetch_add(cuda_textures, Relaxed) + cuda_textures;
+                let bytes_total = CUDA_DETILE_STATS[2].fetch_add(cuda_bytes, Relaxed) + cuda_bytes;
+                let us_total = CUDA_DETILE_STATS[3].fetch_add(elapsed_us, Relaxed) + elapsed_us;
+                if batches == 1 || batches.is_multiple_of(500) {
+                    tracing::info!(
+                        "cuda-oxide zero-copy detile: {batches} batches, {tex_total} textures, {} MB, avg {:.1} us/batch",
+                        bytes_total >> 20,
+                        us_total as f64 / batches as f64
+                    );
+                }
+                Some(fence_val)
+            }
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "cuda-oxide detile batch failed; falling back to CPU detile for this batch"
+                );
+                // Reset `last.hash` on jobs we tentatively claimed so CPU `Staging::refresh` runs cleanly.
+                for (idx, job) in jobs.iter().enumerate() {
+                    if cuda.placements[idx].is_some() {
+                        job.staging.forget();
+                        cuda.placements[idx] = None;
+                    }
+                }
+                None
+            }
+        }
+    }
 }
 
 impl Job {
     /// # Safety
     /// `list` is an open copy list, and the job lives until it has run.
     unsafe fn record(&self, list: &ID3D12GraphicsCommandList) {
+        // SAFETY: caller's contract; `self.staging.buffer` lives as long as `self`.
+        unsafe { self.record_from(list, &self.staging.buffer, self.staging.base) };
+    }
+
+    /// # Safety
+    /// `list` is an open copy list, and both `source` and `self` live until it has run.
+    unsafe fn record_from(
+        &self,
+        list: &ID3D12GraphicsCommandList,
+        source: &ID3D12Resource,
+        base: u64,
+    ) {
         let (s, texture) = (&self.staging, &self.copy.texture);
         for (i, footprint) in s.footprints.iter().enumerate() {
             let to = D3D12_TEXTURE_COPY_LOCATION {
@@ -315,10 +629,10 @@ impl Job {
             };
             let from = D3D12_TEXTURE_COPY_LOCATION {
                 // SAFETY: as above.
-                pResource: unsafe { std::mem::transmute_copy(&s.buffer) },
+                pResource: unsafe { std::mem::transmute_copy(source) },
                 Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
                 Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT { Offset: s.base + footprint.Offset, ..*footprint },
+                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT { Offset: base + footprint.Offset, ..*footprint },
                 },
             };
             // SAFETY: the caller's.

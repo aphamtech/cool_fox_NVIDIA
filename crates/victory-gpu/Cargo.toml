@@ -19,6 +19,7 @@ lz4_flex.workspace = true
 victory-formats.workspace = true
 victory-pipeline.workspace = true
 victory-shader.workspace = true
+cuda-accel = { workspace = true, optional = true }
 
 [build-dependencies]
 blake3.workspace = true
@@ -38,6 +39,8 @@ harness = false
 [features]
 # Debugging switches (frame capture, the host debug layer, per-draw data).
 diagnostics = []
+# Optional NVIDIA CUDA / cuda-oxide GPU offload (zero-copy DX12 NT shared-handle interop).
+cuda-oxide = ["dep:cuda-accel"]
 
 [lints]
 workspace = true

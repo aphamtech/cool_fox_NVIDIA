@@ -8,6 +8,8 @@
 use std::sync::OnceLock;
 
 pub mod contracts;
+#[cfg(windows)]
+pub mod cuda_bridge;
 pub mod uma_bridge;
 pub mod velocity_io;
 
@@ -15,12 +17,14 @@ pub use contracts::{
     AliasingBarrierDesc, AliasingTracker, AsyncIoBackend, AsyncReadCompletion, AsyncReadOp,
     BarrierBatchStats, BarrierBatcher, BarrierSink, BcPackFormat, BufferCopyOp,
     ComputeQueueBackend, CopyQueueBackend, DStorageDestination, DStoragePlatformHooks,
-    DStoragePriority, DStorageRequestDesc, DStorageSource, DecompressionBackend,
-    DecompressionCodec, DecompressionExecutionMode, DecompressionJob, DecompressionOutput,
-    FileHandleId, GpuFenceToken, GpuHeapBackend, GpuTimelineFence, GpuVirtualAddress, HeapId,
-    HeapRange, MemoryTier, RebarCapabilities, ResourceId, ResourceStateFlags, SubresourceIndex,
-    TransitionBarrierDesc, TranslatedBarrier, UavBarrierDesc, UmaBridgeError, UploadAllocator,
-    UploadSlice, VelocityIoError,
+    DStoragePriority, DStorageRequestDesc, DStorageSource, DecompressBlockDesc,
+    DecompressionBackend, DecompressionCodec, DecompressionExecutionMode, DecompressionJob,
+    DecompressionOutput, DetileDispatchDesc, FileHandleId, GpuComputeBackend, GpuFenceToken,
+    GpuHeapBackend, GpuTimelineFence, GpuVirtualAddress, HeapId, HeapRange, MemoryTier,
+    ReadbackDeltaPair, ReadbackPieceDesc, RebarCapabilities, ResourceId, ResourceStateFlags,
+    SharedBufferHandle, SharedFenceHandle, SubresourceIndex, TransitionBarrierDesc,
+    TranslatedBarrier, UavBarrierDesc, UmaBridgeError, UploadAllocator, UploadSlice,
+    VelocityIoError,
 };
 #[cfg(windows)]
 pub use uma_bridge::D3D12CommandListBarrierSink;

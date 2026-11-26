@@ -10,6 +10,9 @@
 # Build output
 /target/
 /tests/fixtures/*/target/
+/crates/cuda_accel/target/
+/crates/cuda_accel/kernels_oxide/target/
+*.ptx
 /logs/
 **/__pycache__/
 *.pyc

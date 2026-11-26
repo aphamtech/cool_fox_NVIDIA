@@ -92,8 +92,21 @@ impl DecompressionRegistry {
         let registry = Self::empty();
         registry.register(Arc::new(UncompressedCopyBackend));
         registry.register(Arc::new(ZlibDecompressionBackend));
-        registry.register(Arc::new(Lz4DecompressionBackend));
-        registry.register(Arc::new(GDeflateDecompressionBackend));
+        #[cfg(all(windows, feature = "cuda-oxide"))]
+        {
+            if crate::graphics::cuda_bridge::is_cuda_oxide_enabled() {
+                registry.register(Arc::new(CudaLz4DecompressionBackend));
+                registry.register(Arc::new(CudaGDeflateDecompressionBackend));
+            } else {
+                registry.register(Arc::new(Lz4DecompressionBackend));
+                registry.register(Arc::new(GDeflateDecompressionBackend));
+            }
+        }
+        #[cfg(not(all(windows, feature = "cuda-oxide")))]
+        {
+            registry.register(Arc::new(Lz4DecompressionBackend));
+            registry.register(Arc::new(GDeflateDecompressionBackend));
+        }
         registry.register(Arc::new(BcPackStubBackend));
         registry
     }
@@ -709,6 +722,219 @@ fn deflate_raw_tile(input: &[u8]) -> Result<Vec<u8>, VelocityIoError> {
 ///   this stub at runtime via [`DecompressionRegistry::register`].
 #[derive(Debug, Default, Clone, Copy)]
 pub struct BcPackStubBackend;
+
+/// Optional `cuda-oxide` GPU-accelerated LZ4 raw block decompression backend.
+///
+/// Offloads large raw LZ4 blocks (`>= 64 KiB`) onto NVIDIA SM 8.9 via `cuda-accel`,
+/// transparently falling back to [`Lz4DecompressionBackend`] for LZ4 frames, small blocks,
+/// or non-NVIDIA hosts.
+#[cfg(all(windows, feature = "cuda-oxide"))]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct CudaLz4DecompressionBackend;
+
+#[cfg(all(windows, feature = "cuda-oxide"))]
+impl DecompressionBackend for CudaLz4DecompressionBackend {
+    fn name(&self) -> &'static str {
+        "cuda-oxide-lz4"
+    }
+
+    fn supported_codecs(&self) -> &'static [DecompressionCodec] {
+        &[DecompressionCodec::Lz4]
+    }
+
+    fn execution_mode(&self) -> DecompressionExecutionMode {
+        DecompressionExecutionMode::GpuComputeShader
+    }
+
+    fn decompress(
+        &self,
+        job: &DecompressionJob<'_>,
+        compute: &dyn ComputeQueueBackend,
+    ) -> Result<DecompressionOutput, VelocityIoError> {
+        // Offload raw LZ4 blocks >= 64 KiB; route LZ4 frames and tiny payloads through CPU `lz4_flex`.
+        if !job.src_bytes.starts_with(&LZ4_FRAME_MAGIC)
+            && !job.src_bytes.is_empty()
+            && job.expected_output_len >= 64 * 1024
+            && let Some(bridge) = crate::graphics::cuda_bridge::global_bridge()
+        {
+            let desc = cuda_accel::DecompressBlockDesc {
+                src_offset: 0,
+                src_len: job.src_bytes.len() as u32,
+                dst_len: job.expected_output_len as u32,
+                dst_offset: 0,
+            };
+            match bridge.context().decompress_host_sync(
+                cuda_accel::CudaDecompressCodec::Lz4RawBlock,
+                job.src_bytes,
+                job.expected_output_len,
+                &[desc],
+            ) {
+                Ok((mut out, written)) => {
+                    let actual = written.first().copied().unwrap_or(0) as usize;
+                    out.truncate(actual);
+                    return Ok(DecompressionOutput {
+                        bytes_written: actual,
+                        completion_fence: None,
+                        cpu_bytes: Some(out),
+                    });
+                }
+                Err(err) => {
+                    tracing::debug!(error = %err, "cuda-oxide LZ4 block failed; falling back to lz4-flex");
+                }
+            }
+        }
+        Lz4DecompressionBackend.decompress(job, compute)
+    }
+}
+
+/// Optional `cuda-oxide` GPU-accelerated open-spec Microsoft GDeflate v1 decompression backend.
+///
+/// Parses the GDeflate v1 multi-tile header and dispatches all independent 64 KiB raw DEFLATE
+/// tiles simultaneously across NVIDIA SMs (1 warp/tile with `__shared__` Huffman LUTs),
+/// falling back cleanly to [`GDeflateDecompressionBackend`] when CUDA is unavailable or for
+/// tiny 0–1 tile streams.
+#[cfg(all(windows, feature = "cuda-oxide"))]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct CudaGDeflateDecompressionBackend;
+
+#[cfg(all(windows, feature = "cuda-oxide"))]
+impl DecompressionBackend for CudaGDeflateDecompressionBackend {
+    fn name(&self) -> &'static str {
+        "cuda-oxide-gdeflate-v1"
+    }
+
+    fn supported_codecs(&self) -> &'static [DecompressionCodec] {
+        &[DecompressionCodec::GDeflate]
+    }
+
+    fn execution_mode(&self) -> DecompressionExecutionMode {
+        DecompressionExecutionMode::GpuComputeShader
+    }
+
+    fn decompress(
+        &self,
+        job: &DecompressionJob<'_>,
+        compute: &dyn ComputeQueueBackend,
+    ) -> Result<DecompressionOutput, VelocityIoError> {
+        let src = job.src_bytes;
+        let header = GDeflateHeader::parse(src)?;
+        let num_tiles = usize::from(header.num_tiles);
+        if num_tiles < 2 {
+            return GDeflateDecompressionBackend.decompress(job, compute);
+        }
+
+        let Some(bridge) = crate::graphics::cuda_bridge::global_bridge() else {
+            return GDeflateDecompressionBackend.decompress(job, compute);
+        };
+
+        let table_bytes = num_tiles * std::mem::size_of::<u32>();
+        let payload_base = GDEFLATE_HEADER_BYTES + table_bytes;
+        if src.len() < payload_base {
+            return Err(VelocityIoError::DecompressionFailed {
+                codec: DecompressionCodec::GDeflate,
+                reason: format!(
+                    "GDeflate v1 stream truncated in tile offset table ({} < {payload_base} B)",
+                    src.len()
+                ),
+            });
+        }
+
+        let tile_cap = header.tile_uncompressed_bytes();
+        let payload = &src[payload_base..];
+        let mut offsets = Vec::with_capacity(num_tiles);
+        for i in 0..num_tiles {
+            let pos = GDEFLATE_HEADER_BYTES + i * 4;
+            let off = u32::from_le_bytes([src[pos], src[pos + 1], src[pos + 2], src[pos + 3]])
+                as usize;
+            offsets.push(off);
+        }
+        if offsets[0] != 0 {
+            return Err(VelocityIoError::DecompressionFailed {
+                codec: DecompressionCodec::GDeflate,
+                reason: format!("expected tile 0 offset to be 0, got {}", offsets[0]),
+            });
+        }
+
+        let capacity = if job.expected_output_len > 0 {
+            job.expected_output_len
+        } else {
+            num_tiles.saturating_mul(tile_cap)
+        };
+        let mut blocks = Vec::with_capacity(num_tiles);
+        for tile_idx in 0..num_tiles {
+            let start = offsets[tile_idx];
+            let end = if tile_idx + 1 < num_tiles {
+                offsets[tile_idx + 1]
+            } else if header.last_tile_size > 0 {
+                start.saturating_add(header.last_tile_size as usize)
+            } else {
+                payload.len()
+            };
+            if start > end || end > payload.len() {
+                return Err(VelocityIoError::DecompressionFailed {
+                    codec: DecompressionCodec::GDeflate,
+                    reason: format!(
+                        "GDeflate tile {tile_idx} slice [{start}..{end}] out of payload bounds ({} B)",
+                        payload.len()
+                    ),
+                });
+            }
+            let dst_off = tile_idx.saturating_mul(tile_cap);
+            let tile_max = capacity.saturating_sub(dst_off).min(tile_cap);
+            blocks.push(cuda_accel::DecompressBlockDesc {
+                src_offset: start as u64,
+                src_len: (end - start) as u32,
+                dst_len: tile_max as u32,
+                dst_offset: dst_off as u64,
+            });
+        }
+
+        match bridge.context().decompress_host_sync(
+            cuda_accel::CudaDecompressCodec::GDeflateV1RawDeflateTile,
+            payload,
+            capacity,
+            &blocks,
+        ) {
+            Ok((mut out, written)) => {
+                // Compact if any non-final tile produced fewer than `tile_cap` bytes.
+                let mut cursor = 0usize;
+                let mut needs_compact = false;
+                for (i, &w) in written.iter().enumerate() {
+                    let expected_off = i * tile_cap;
+                    if expected_off != cursor {
+                        needs_compact = true;
+                        break;
+                    }
+                    cursor += w as usize;
+                }
+                if needs_compact {
+                    let mut compacted = Vec::with_capacity(written.iter().map(|&w| w as usize).sum());
+                    for (i, &w) in written.iter().enumerate() {
+                        let start = i * tile_cap;
+                        compacted.extend_from_slice(&out[start..start + w as usize]);
+                    }
+                    let len = compacted.len();
+                    Ok(DecompressionOutput {
+                        bytes_written: len,
+                        completion_fence: None,
+                        cpu_bytes: Some(compacted),
+                    })
+                } else {
+                    out.truncate(cursor);
+                    Ok(DecompressionOutput {
+                        bytes_written: cursor,
+                        completion_fence: None,
+                        cpu_bytes: Some(out),
+                    })
+                }
+            }
+            Err(err) => {
+                tracing::debug!(error = %err, "cuda-oxide GDeflate v1 failed; falling back to zlib-rs");
+                GDeflateDecompressionBackend.decompress(job, compute)
+            }
+        }
+    }
+}
 
 impl DecompressionBackend for BcPackStubBackend {
     fn name(&self) -> &'static str {

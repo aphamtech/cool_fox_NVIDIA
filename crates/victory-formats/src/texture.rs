@@ -537,6 +537,46 @@ impl Layout {
         self.desc.swizzle == Swizzle::LINEAR || !self.pattern[0].is_empty()
     }
 
+    /// Exposes the precomputed GFX10 RB+ byte-offset LUTs `[x, y, z]` inside a
+    /// swizzle block (empty for linear or unsupported modes), enabling GPU
+    /// detile kernels to upload the exact addrlib tables without duplication.
+    pub fn swizzle_lut(&self) -> &[Vec<u32>; 3] {
+        self.pattern
+    }
+
+    /// Returns the deterministic `(micro_kind, block_index, element_log2)` key
+    /// identifying this layout's GFX10 RB+ swizzle table (`0..45`), or `None`
+    /// for linear or unsupported modes.
+    pub fn swizzle_lut_key(&self) -> Option<(usize, usize, usize)> {
+        if self.desc.swizzle == Swizzle::LINEAR || self.pattern[0].is_empty() {
+            return None;
+        }
+        let block_log2 = self.desc.swizzle.block_log2()?;
+        let kind = if self.thick {
+            2
+        } else {
+            usize::from(self.desc.swizzle.display())
+        };
+        let block_index = ((block_log2 - 8) / 4) as usize;
+        let element_log2 = self.desc.element_bytes.trailing_zeros() as usize;
+        Some((kind, block_index, element_log2))
+    }
+
+    /// Returns all 45 immutable GFX10 RB+ swizzle LUTs in canonical
+    /// `(kind * 3 + block_index) * 5 + element_log2` order for one-time GPU upload.
+    pub fn all_swizzle_luts() -> Vec<&'static [Vec<u32>; 3]> {
+        let mut out = Vec::with_capacity(45);
+        for kind in 0..3usize {
+            for block_index in 0..3u32 {
+                let block_log2 = 8 + block_index * 4;
+                for element_log2 in 0..5u32 {
+                    out.push(shared_pattern(kind, element_log2, block_log2));
+                }
+            }
+        }
+        out
+    }
+
     /// The slice and the depth inside it for `z` (an array slice or a 3D
     /// depth slice).
     fn split(&self, z: u32) -> (u32, u32) {

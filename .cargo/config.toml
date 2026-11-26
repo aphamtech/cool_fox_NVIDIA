@@ -1,2 +1,7 @@
 [alias]
 xtask = "run --quiet --package xtask --"
+
+[target.x86_64-pc-windows-msvc]
+# Enable host CPU ISA (Zen 3 on 5800X3D: AVX2, BMI2, POPCNT, TZCNT/LZCNT, FMA,
+# and Zen 3 instruction scheduling) for all release/test builds.
+rustflags = ["-C", "target-cpu=native"]

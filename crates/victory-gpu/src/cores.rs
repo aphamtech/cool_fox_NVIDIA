@@ -70,7 +70,9 @@ pub(crate) fn keep_many_on_fast_cores(what: &str) {
 }
 
 fn ask(what: &str, from: u32) {
-    use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadSelectedCpuSets};
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentThread, SetThreadIdealProcessor, SetThreadSelectedCpuSets,
+    };
     if stage() < from {
         return;
     }
@@ -79,8 +81,37 @@ fn ask(what: &str, from: u32) {
         let sets = cpu_sets();
         (fast_of(&sets), sets.len())
     });
-    // All alike (or nothing known): nothing to ask for.
+    // All cores homogeneous (e.g. AMD Ryzen 7 5800X3D single-CCD 8C/16T with
+    // shared 96 MB 3D V-Cache): spread hot engine threads across distinct
+    // physical cores (even logical IDs on Windows SMT) via a soft ideal-core
+    // hint so each thread gets its own 512 KB L2 cache without starving others.
     if fast.is_empty() {
+        if *of >= 12 {
+            static NEXT_PHYSICAL: std::sync::atomic::AtomicU32 =
+                std::sync::atomic::AtomicU32::new(3);
+            let physical_cores = (*of / 2) as u32;
+            let core = match what {
+                "victory-submit" => 0,
+                "victory-heap-sync" => 1,
+                "victory-relay" => 2,
+                _ => {
+                    let slot = NEXT_PHYSICAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    // Spread helper threads across remaining physical cores.
+                    3 + (slot.wrapping_sub(3) % physical_cores.saturating_sub(3).max(1))
+                }
+            };
+            let logical = (core % physical_cores) * 2;
+            // SAFETY: soft scheduler preference for our own thread.
+            let prev = unsafe { SetThreadIdealProcessor(GetCurrentThread(), logical) };
+            if prev != u32::MAX {
+                tracing::info!(
+                    what,
+                    ideal_cpu = logical,
+                    cores = physical_cores,
+                    "thread assigned dedicated physical-core L2 hint"
+                );
+            }
+        }
         return;
     }
     // SAFETY: our own thread and a list of the system's own set ids.
