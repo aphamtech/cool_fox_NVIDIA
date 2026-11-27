@@ -42,7 +42,7 @@ if not exist "%VICTORY_TITLE_EXE%" (
 rem "runner=%VICTORY_REPO%\victory-3d-rtx-pareto-residency.exe"
 if not exist "%runner%" set "runner=%VICTORY_RELEASE%"
 
-set "VICTORY_UMA_BRIDGE=0"
+set "VICTORY_UMA_BRIDGE=1"
 set "VICTORY_VELOCITY_IO=1"
 set "VICTORY_VELOCITY_IO_LEGACY_BCPACK=1"
 if not defined VICTORY_AMBIENT_AIR set "VICTORY_AMBIENT_AIR=1"

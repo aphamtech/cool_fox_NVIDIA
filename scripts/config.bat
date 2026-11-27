@@ -22,9 +22,9 @@ set "VICTORY_DIAG=%VICTORY_REPO%\target\diag\victory.exe"
 set "VICTORY_PLAY=%VICTORY_REPO%\scripts\play.ps1"
 
 rem NVIDIA RTX subsystems (override to 0 before calling for A/B testing).
-if not defined VICTORY_UMA_BRIDGE set "VICTORY_UMA_BRIDGE=1"
-if not defined VICTORY_VELOCITY_IO set "VICTORY_VELOCITY_IO=1"
-if not defined VICTORY_VELOCITY_IO_LEGACY_BCPACK set "VICTORY_VELOCITY_IO_LEGACY_BCPACK=1"
+if not defined VICTORY_UMA_BRIDGE set "VICTORY_UMA_BRIDGE=0"
+if not defined VICTORY_VELOCITY_IO set "VICTORY_VELOCITY_IO=0"
+if not defined VICTORY_VELOCITY_IO_LEGACY_BCPACK set "VICTORY_VELOCITY_IO_LEGACY_BCPACK=0"
 
 rem victory.toml is looked up in the current directory by default.
 cd /d "%VICTORY_REPO%" || exit /b 1

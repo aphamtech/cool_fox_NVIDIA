@@ -21,7 +21,7 @@ if /i "%~1"=="-NoPrecompile" (
 echo Usage: Play-VIctory.cmd [pareto-residency] [--no-precompile] 1>&2
 exit /b 2
 :args_done
-if not defined VICTORY_GAME_DIR set "VICTORY_GAME_DIR=%~dp0..\GTA6.Xbox.v1.0.2.1-CYBERLEEK"
+if not defined VICTORY_GAME_DIR set "VICTORY_GAME_DIR="K:\GAME OFFLINE\Rockstar\GTA VI\GTA6.Xbox.v1.0.2.1-CYBERLEEK"
 if not exist "%VICTORY_GAME_DIR%\game_scarlett_master.exe" (
   echo Set VICTORY_GAME_DIR to your own dump folder containing game_scarlett_master.exe. 1>&2
   exit /b 2
